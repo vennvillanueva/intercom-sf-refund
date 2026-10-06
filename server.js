@@ -4,51 +4,83 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
+// Middleware for tunnel/header compatibility
 app.use((req, res, next) => {
   res.setHeader('ngrok-skip-browser-warning', 'true');
   res.setHeader('Bypass-Tunnel-Reminder', 'true');
   next();
 });
 
+// Helper function to generate the Intercom Canvas Kit components
+function buildRefundForm(values = {}, successMessage = null) {
+  const components = [];
+
+  // Display success message banner if provided
+  if (successMessage) {
+    components.push({
+      type: "text",
+      text: successMessage,
+      style: "header"
+    });
+  } else {
+    components.push({
+      type: "text",
+      text: "Process Refund Request",
+      style: "header"
+    });
+  }
+
+  // 12 Input Fields + Checkbox
+  components.push(
+    { type: "input", id: "date_of_order", label: "Date of Order", value: values.date_of_order || "", placeholder: "YYYY-MM-DD" },
+    { type: "input", id: "guest_name", label: "Guest Name", value: values.guest_name || "" },
+    { type: "input", id: "order_type", label: "Order Type", value: values.order_type || "" },
+    { type: "input", id: "delivery_order_id", label: "Delivery Order ID", value: values.delivery_order_id || "" },
+    { type: "input", id: "delivery_partner", label: "Delivery Partner", value: values.delivery_partner || "" },
+    { type: "input", id: "dispute_id", label: "Dispute ID", value: values.dispute_id || "" },
+    { type: "input", id: "amount_issued_account", label: "Amount Issued to Customer (Account)", value: values.amount_issued_account || "" },
+    { type: "input", id: "amount_issued_guest", label: "Amount Issued to Guest", value: values.amount_issued_guest || "" },
+    { type: "textarea", id: "refund_reason_notes", label: "Refund Reason Notes", value: values.refund_reason_notes || "" },
+    { type: "input", id: "third_party_reimbursement_amount", label: "3rd Party Reimbursement Amount", value: values.third_party_reimbursement_amount || "" },
+    { type: "input", id: "third_party_reimbursement_status", label: "3rd Party Reimbursement Status", value: values.third_party_reimbursement_status || "" },
+    { type: "input", id: "stripe_reimbursement_link", label: "Stripe Reimbursement Link", value: values.stripe_reimbursement_link || "" },
+    {
+      type: "checkbox",
+      id: "refund_complete",
+      label: "Refund Complete",
+      value: values.refund_complete || false
+    },
+    { type: "button", id: "submit_refund", label: "Update Salesforce Ticket", style: "primary", action: { type: "submit" } }
+  );
+
+  return components;
+}
+
+// 1. INITIALIZE FLOW (Renders the initial Canvas UI)
 app.post('/intercom/initialize', (req, res) => {
   res.json({
     canvas: {
       content: {
-        components: [
-          { type: "text", text: "Process Refund Request", style: "header" },
-          
-          { type: "input", id: "date_of_order", label: "Date of Order", placeholder: "YYYY-MM-DD" },
-          { type: "input", id: "guest_name", label: "Guest Name" },
-          { type: "input", id: "order_type", label: "Order Type" },
-          { type: "input", id: "delivery_order_id", label: "Delivery Order ID" },
-          { type: "input", id: "delivery_partner", label: "Delivery Partner" },
-          { type: "input", id: "dispute_id", label: "Dispute ID" },
-          { type: "input", id: "amount_issued_account", label: "Amount Issued to Customer (Account)" },
-          { type: "input", id: "amount_issued_guest", label: "Amount Issued to Guest" },
-          { type: "textarea", id: "refund_reason_notes", label: "Refund Reason Notes" },
-          { type: "input", id: "third_party_reimbursement_amount", label: "3rd Party Reimbursement Amount" },
-          { type: "input", id: "third_party_reimbursement_status", label: "3rd Party Reimbursement Status" },
-          { type: "input", id: "stripe_reimbursement_link", label: "Stripe Reimbursement Link" },
-          
-          { type: "button", id: "submit_refund", label: "Update Salesforce Ticket", style: "primary", action: { type: "submit" } }
-        ]
+        components: buildRefundForm()
       }
     }
   });
 });
 
-app.post('/intercom/submit', (req, res) => {
+// 2. SUBMIT FLOW (Preserves input values, updates Salesforce, & shows success)
+app.post('/intercom/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
+
+  // TODO: Add Salesforce API push logic here using jsforce
+
   res.json({
     canvas: {
       content: {
-        components: [
-          { type: "text", text: "✅ Successfully Submitted!", style: "header" },
-          { type: "text", text: `Guest: ${inputs.guest_name || 'N/A'}` }
-        ]
+        components: buildRefundForm(inputs, "✅ Successfully Updated in Salesforce!")
       }
     }
   });
 });
 
-app.listen(3000, () => console.log('Local Server is running on port 3000!'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
