@@ -11,6 +11,27 @@ app.use((req, res, next) => {
   next();
 });
 
+// Reusable JSForce Connection
+let sfConn = null;
+
+async function getSalesforceConnection() {
+  if (sfConn && sfConn.accessToken) {
+    return sfConn;
+  }
+  
+  sfConn = new jsforce.Connection({
+    loginUrl: process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com',
+    version: '57.0'
+  });
+
+  await sfConn.login(
+    process.env.SF_USERNAME,
+    process.env.SF_PASSWORD + process.env.SF_SECURITY_TOKEN
+  );
+
+  return sfConn;
+}
+
 // Helper function to build Canvas Kit UI
 function buildRefundForm(values = {}, successMessage = null) {
   const components = [];
@@ -33,7 +54,7 @@ function buildRefundForm(values = {}, successMessage = null) {
     { type: "input", id: "date_of_order", label: "Date of Order", value: values.date_of_order || "", placeholder: "YYYY-MM-DD" },
     { type: "input", id: "guest_name", label: "Guest Name", value: values.guest_name || "" },
     
-    // Dropdown Component for Order Type (Picklist)
+    // Dropdown Component for Order Type
     {
       type: "dropdown",
       id: "order_type",
@@ -57,7 +78,7 @@ function buildRefundForm(values = {}, successMessage = null) {
     { type: "input", id: "third_party_reimbursement_status", label: "3rd Party Reimbursement Status", value: values.third_party_reimbursement_status || "" },
     { type: "input", id: "stripe_reimbursement_link", label: "Stripe Reimbursement Link", value: values.stripe_reimbursement_link || "" },
     
-    // Dropdown Component for Refund Complete (Blank, Yes, No)
+    // Dropdown Component for Refund Complete
     {
       type: "dropdown",
       id: "refund_complete",
@@ -87,11 +108,10 @@ app.post('/intercom/initialize', (req, res) => {
   });
 });
 
-// 2. SUBMIT FLOW (Salesforce Update Integration)
+// 2. SUBMIT FLOW
 app.post('/intercom/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
   
-  // Hanapin ang salesforce_id sa lahat ng posibleng JSON paths mula sa Intercom
   const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
                 || req.body.custom_attributes?.salesforce_id
                 || req.body.customer?.custom_attributes?.salesforce_id;
@@ -99,14 +119,7 @@ app.post('/intercom/submit', async (req, res) => {
   console.log("Detected Salesforce Case ID:", sfCaseId);
 
   try {
-    const conn = new jsforce.Connection({
-      loginUrl: process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com'
-    });
-
-    await conn.login(
-      process.env.SF_USERNAME,
-      process.env.SF_PASSWORD + process.env.SF_SECURITY_TOKEN
-    );
+    const conn = await getSalesforceConnection();
 
     const sfData = {
       Date_of_Order__c: inputs.date_of_order || null,
@@ -140,6 +153,9 @@ app.post('/intercom/submit', async (req, res) => {
 
   } catch (error) {
     console.error("Salesforce Push Error:", error);
+    // Reset connection if authentication failed
+    sfConn = null;
+
     res.json({
       canvas: {
         content: {
@@ -152,4 +168,3 @@ app.post('/intercom/submit', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
