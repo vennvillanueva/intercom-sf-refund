@@ -125,12 +125,42 @@ function buildRefundForm(values = {}, successMessage = null) {
   return components;
 }
 
-// 1. INITIALIZE FLOW
-app.post('/intercom/initialize', (req, res) => {
+// 1. INITIALIZE FLOW (Pre-populate with existing Salesforce Data on Hard Refresh)
+app.post('/intercom/initialize', async (req, res) => {
+  const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
+                || req.body.custom_attributes?.salesforce_id
+                || req.body.customer?.custom_attributes?.salesforce_id;
+
+  let existingValues = {};
+
+  if (sfCaseId) {
+    try {
+      const conn = await getSalesforceConnection();
+      const sfRecord = await conn.sobject('Case').retrieve(sfCaseId);
+
+      if (sfRecord) {
+        existingValues = {
+          date_of_order: sfRecord.Date_of_Order__c || "",
+          guest_name: sfRecord.Guest_Name__c || "",
+          order_type: sfRecord.Order_Type__c || "Delivery",
+          delivery_order_id: sfRecord.Delivery_Order_ID__c || "",
+          delivery_partner: sfRecord.Delivery_Partner__c || "",
+          dispute_id: sfRecord.Dispute_ID__c || "",
+          amount_issued_account: sfRecord.Amount_Issued_to_Customer_Account__c ? String(sfRecord.Amount_Issued_to_Customer_Account__c) : "",
+          amount_issued_guest: sfRecord.Amount_Issued_to_Guest__c ? String(sfRecord.Amount_Issued_to_Guest__c) : "",
+          refund_reason_notes: sfRecord.Refund_Reason_Notes__c || "",
+          refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
+        };
+      }
+    } catch (err) {
+      console.error("Error fetching existing record on initialize:", err.message);
+    }
+  }
+
   res.json({
     canvas: {
       content: {
-        components: buildRefundForm()
+        components: buildRefundForm(existingValues)
       }
     }
   });
@@ -181,7 +211,7 @@ app.post('/intercom/submit', async (req, res) => {
 
   } catch (error) {
     console.error("Salesforce Push Error:", error);
-    sfConn = null; // Reset connection kapag nag-error
+    sfConn = null;
 
     res.json({
       canvas: {
