@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const jsforce = require('jsforce');
 
 const app = express();
 app.use(express.json());
@@ -10,7 +11,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Helper function to build 100% valid Canvas Kit inputs
+// Helper function to build Canvas Kit UI
 function buildRefundForm(values = {}, successMessage = null) {
   const components = [];
 
@@ -31,7 +32,7 @@ function buildRefundForm(values = {}, successMessage = null) {
   components.push(
     { type: "input", id: "date_of_order", label: "Date of Order", value: values.date_of_order || "", placeholder: "YYYY-MM-DD" },
     { type: "input", id: "guest_name", label: "Guest Name", value: values.guest_name || "" },
-    { type: "input", id: "order_type", label: "Order Type", value: values.order_type || "" },
+    { type: "input", id: "order_type", label: "Order Type (Delivery/Pickup/Dispute/Other)", value: values.order_type || "" },
     { type: "input", id: "delivery_order_id", label: "Delivery Order ID", value: values.delivery_order_id || "" },
     { type: "input", id: "delivery_partner", label: "Delivery Partner", value: values.delivery_partner || "" },
     { type: "input", id: "dispute_id", label: "Dispute ID", value: values.dispute_id || "" },
@@ -48,6 +49,7 @@ function buildRefundForm(values = {}, successMessage = null) {
   return components;
 }
 
+// 1. INITIALIZE FLOW
 app.post('/intercom/initialize', (req, res) => {
   res.json({
     canvas: {
@@ -58,18 +60,69 @@ app.post('/intercom/initialize', (req, res) => {
   });
 });
 
+// 2. SUBMIT FLOW (Salesforce Update Integration)
 app.post('/intercom/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
+  
+  // Hanapin ang Salesforce Case ID mula sa Intercom payload
+  const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
+                || req.body.customer?.custom_attributes?.salesforce_id;
 
-  res.json({
-    canvas: {
-      content: {
-        components: buildRefundForm(inputs, "✅ Successfully Updated in Salesforce!")
-      }
+  try {
+    const conn = new jsforce.Connection({
+      loginUrl: process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com'
+    });
+
+    await conn.login(
+      process.env.SF_USERNAME,
+      process.env.SF_PASSWORD + process.env.SF_SECURITY_TOKEN
+    );
+
+    // I-prepare ang exact Salesforce fields
+    const sfData = {
+      Date_of_Order__c: inputs.date_of_order || null,
+      Guest_Name__c: inputs.guest_name || null,
+      Order_Type__c: inputs.order_type || null,
+      Delivery_Order_ID__c: inputs.delivery_order_id || null,
+      Delivery_Partner__c: inputs.delivery_partner || null,
+      Dispute_ID__c: inputs.dispute_id || null,
+      Amount_Issued_to_Customer_Account__c: inputs.amount_issued_account ? parseFloat(inputs.amount_issued_account) : null,
+      Amount_Issued_to_Guest__c: inputs.amount_issued_guest ? parseFloat(inputs.amount_issued_guest) : null,
+      Refund_Reason_Notes__c: inputs.refund_reason_notes || null,
+      Refund_Complete__c: inputs.refund_complete === "Yes" || inputs.refund_complete === "true"
+    };
+
+    if (sfCaseId) {
+      // Update existing Case
+      sfData.Id = sfCaseId;
+      await conn.sobject('Case').update(sfData);
+      console.log(`Salesforce Case Updated: ${sfCaseId}`);
+    } else {
+      // Create new Case
+      const result = await conn.sobject('Case').create(sfData);
+      console.log(`New Salesforce Case Created: ${result.id}`);
     }
-  });
+
+    res.json({
+      canvas: {
+        content: {
+          components: buildRefundForm(inputs, "✅ Successfully Synced to Salesforce QA!")
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error("Salesforce Push Error:", error);
+    res.json({
+      canvas: {
+        content: {
+          components: buildRefundForm(inputs, `❌ Salesforce Sync Error: ${error.message}`)
+        }
+      }
+    });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
