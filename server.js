@@ -32,7 +32,21 @@ function buildRefundForm(values = {}, successMessage = null) {
   components.push(
     { type: "input", id: "date_of_order", label: "Date of Order", value: values.date_of_order || "", placeholder: "YYYY-MM-DD" },
     { type: "input", id: "guest_name", label: "Guest Name", value: values.guest_name || "" },
-    { type: "input", id: "order_type", label: "Order Type (Delivery/Pickup/Dispute/Other)", value: values.order_type || "" },
+    
+    // Dropdown Component for Order Type (Picklist)
+    {
+      type: "dropdown",
+      id: "order_type",
+      label: "Order Type",
+      options: [
+        { type: "option", id: "Delivery", text: "Delivery" },
+        { type: "option", id: "Pickup", text: "Pickup" },
+        { type: "option", id: "Dispute", text: "Dispute" },
+        { type: "option", id: "Other", text: "Other" }
+      ],
+      value: values.order_type || "Delivery"
+    },
+
     { type: "input", id: "delivery_order_id", label: "Delivery Order ID", value: values.delivery_order_id || "" },
     { type: "input", id: "delivery_partner", label: "Delivery Partner", value: values.delivery_partner || "" },
     { type: "input", id: "dispute_id", label: "Dispute ID", value: values.dispute_id || "" },
@@ -42,7 +56,20 @@ function buildRefundForm(values = {}, successMessage = null) {
     { type: "input", id: "third_party_reimbursement_amount", label: "3rd Party Reimbursement Amount", value: values.third_party_reimbursement_amount || "" },
     { type: "input", id: "third_party_reimbursement_status", label: "3rd Party Reimbursement Status", value: values.third_party_reimbursement_status || "" },
     { type: "input", id: "stripe_reimbursement_link", label: "Stripe Reimbursement Link", value: values.stripe_reimbursement_link || "" },
-    { type: "input", id: "refund_complete", label: "Refund Complete (Yes/No)", value: values.refund_complete || "", placeholder: "Yes or No" },
+    
+    // Dropdown Component for Refund Complete (Blank, Yes, No)
+    {
+      type: "dropdown",
+      id: "refund_complete",
+      label: "Refund Complete",
+      options: [
+        { type: "option", id: "", text: "-- Select --" },
+        { type: "option", id: "Yes", text: "Yes" },
+        { type: "option", id: "No", text: "No" }
+      ],
+      value: values.refund_complete || ""
+    },
+
     { type: "button", id: "submit_refund", label: "Update Salesforce Ticket", style: "primary", action: { type: "submit" } }
   );
 
@@ -64,9 +91,12 @@ app.post('/intercom/initialize', (req, res) => {
 app.post('/intercom/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
   
-  // Hanapin ang Salesforce Case ID mula sa Intercom payload
+  // Hanapin ang salesforce_id sa lahat ng posibleng JSON paths mula sa Intercom
   const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
+                || req.body.custom_attributes?.salesforce_id
                 || req.body.customer?.custom_attributes?.salesforce_id;
+
+  console.log("Detected Salesforce Case ID:", sfCaseId);
 
   try {
     const conn = new jsforce.Connection({
@@ -78,7 +108,6 @@ app.post('/intercom/submit', async (req, res) => {
       process.env.SF_PASSWORD + process.env.SF_SECURITY_TOKEN
     );
 
-    // I-prepare ang exact Salesforce fields
     const sfData = {
       Date_of_Order__c: inputs.date_of_order || null,
       Guest_Name__c: inputs.guest_name || null,
@@ -89,18 +118,16 @@ app.post('/intercom/submit', async (req, res) => {
       Amount_Issued_to_Customer_Account__c: inputs.amount_issued_account ? parseFloat(inputs.amount_issued_account) : null,
       Amount_Issued_to_Guest__c: inputs.amount_issued_guest ? parseFloat(inputs.amount_issued_guest) : null,
       Refund_Reason_Notes__c: inputs.refund_reason_notes || null,
-      Refund_Complete__c: inputs.refund_complete === "Yes" || inputs.refund_complete === "true"
+      Refund_Complete__c: inputs.refund_complete === "Yes"
     };
 
     if (sfCaseId) {
-      // Update existing Case
       sfData.Id = sfCaseId;
       await conn.sobject('Case').update(sfData);
-      console.log(`Salesforce Case Updated: ${sfCaseId}`);
+      console.log(`Successfully Updated Salesforce Case: ${sfCaseId}`);
     } else {
-      // Create new Case
       const result = await conn.sobject('Case').create(sfData);
-      console.log(`New Salesforce Case Created: ${result.id}`);
+      console.log(`Created New Salesforce Case: ${result.id}`);
     }
 
     res.json({
@@ -116,7 +143,7 @@ app.post('/intercom/submit', async (req, res) => {
     res.json({
       canvas: {
         content: {
-          components: buildRefundForm(inputs, `❌ Salesforce Sync Error: ${error.message}`)
+          components: buildRefundForm(inputs, `❌ Sync Error: ${error.message}`)
         }
       }
     });
