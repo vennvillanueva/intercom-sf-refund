@@ -42,12 +42,16 @@ function buildRefundForm(values = {}, successMessage = null) {
     { type: "input", id: "third_party_reimbursement_status", label: "3rd Party Reimbursement Status", value: values.third_party_reimbursement_status || "" },
     { type: "input", id: "stripe_reimbursement_link", label: "Stripe Reimbursement Link", value: values.stripe_reimbursement_link || "" },
     
-    // Clean & Standard Checkbox Component
+    // Dropdown Component for Refund Complete (Yes / No)
     {
-      type: "checkbox",
+      type: "dropdown",
       id: "refund_complete",
       label: "Refund Complete",
-      value: values.refund_complete === "true" || values.refund_complete === true
+      options: [
+        { id: "No", text: "No" },
+        { id: "Yes", text: "Yes" }
+      ],
+      value: values.refund_complete || "No"
     },
 
     { type: "button", id: "submit_refund", label: "Update Salesforce Ticket", style: "primary", action: { type: "submit" } }
