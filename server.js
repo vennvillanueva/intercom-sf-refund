@@ -10,7 +10,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Helper function to build Canvas Kit components with valid Intercom Schema
+// Helper function to build Canvas Kit components
 function buildRefundForm(values = {}, successMessage = null) {
   const components = [];
 
@@ -28,9 +28,6 @@ function buildRefundForm(values = {}, successMessage = null) {
     });
   }
 
-  // Preserve checkbox state
-  const isChecked = values.refund_complete && values.refund_complete.includes("complete");
-
   components.push(
     { type: "input", id: "date_of_order", label: "Date of Order", value: values.date_of_order || "", placeholder: "YYYY-MM-DD" },
     { type: "input", id: "guest_name", label: "Guest Name", value: values.guest_name || "" },
@@ -45,17 +42,12 @@ function buildRefundForm(values = {}, successMessage = null) {
     { type: "input", id: "third_party_reimbursement_status", label: "3rd Party Reimbursement Status", value: values.third_party_reimbursement_status || "" },
     { type: "input", id: "stripe_reimbursement_link", label: "Stripe Reimbursement Link", value: values.stripe_reimbursement_link || "" },
     
-    // Correct Intercom Canvas Kit Checkbox Format
+    // Clean & Standard Checkbox Component
     {
-      type: "checkbox_group",
+      type: "checkbox",
       id: "refund_complete",
-      options: [
-        {
-          id: "complete",
-          text: "Refund Complete"
-        }
-      ],
-      value: isChecked ? ["complete"] : []
+      label: "Refund Complete",
+      value: values.refund_complete === "true" || values.refund_complete === true
     },
 
     { type: "button", id: "submit_refund", label: "Update Salesforce Ticket", style: "primary", action: { type: "submit" } }
