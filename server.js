@@ -4,18 +4,16 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-// Middleware for tunnel/header compatibility
 app.use((req, res, next) => {
   res.setHeader('ngrok-skip-browser-warning', 'true');
   res.setHeader('Bypass-Tunnel-Reminder', 'true');
   next();
 });
 
-// Helper function to generate the Intercom Canvas Kit components
+// Helper function to build Canvas Kit components with valid Intercom Schema
 function buildRefundForm(values = {}, successMessage = null) {
   const components = [];
 
-  // Display success message banner if provided
   if (successMessage) {
     components.push({
       type: "text",
@@ -30,7 +28,9 @@ function buildRefundForm(values = {}, successMessage = null) {
     });
   }
 
-  // 12 Input Fields + Checkbox
+  // Preserve checkbox state
+  const isChecked = values.refund_complete && values.refund_complete.includes("complete");
+
   components.push(
     { type: "input", id: "date_of_order", label: "Date of Order", value: values.date_of_order || "", placeholder: "YYYY-MM-DD" },
     { type: "input", id: "guest_name", label: "Guest Name", value: values.guest_name || "" },
@@ -44,19 +44,26 @@ function buildRefundForm(values = {}, successMessage = null) {
     { type: "input", id: "third_party_reimbursement_amount", label: "3rd Party Reimbursement Amount", value: values.third_party_reimbursement_amount || "" },
     { type: "input", id: "third_party_reimbursement_status", label: "3rd Party Reimbursement Status", value: values.third_party_reimbursement_status || "" },
     { type: "input", id: "stripe_reimbursement_link", label: "Stripe Reimbursement Link", value: values.stripe_reimbursement_link || "" },
+    
+    // Correct Intercom Canvas Kit Checkbox Format
     {
-      type: "checkbox",
+      type: "checkbox_group",
       id: "refund_complete",
-      label: "Refund Complete",
-      value: values.refund_complete || false
+      options: [
+        {
+          id: "complete",
+          text: "Refund Complete"
+        }
+      ],
+      value: isChecked ? ["complete"] : []
     },
+
     { type: "button", id: "submit_refund", label: "Update Salesforce Ticket", style: "primary", action: { type: "submit" } }
   );
 
   return components;
 }
 
-// 1. INITIALIZE FLOW (Renders the initial Canvas UI)
 app.post('/intercom/initialize', (req, res) => {
   res.json({
     canvas: {
@@ -67,11 +74,8 @@ app.post('/intercom/initialize', (req, res) => {
   });
 });
 
-// 2. SUBMIT FLOW (Preserves input values, updates Salesforce, & shows success)
 app.post('/intercom/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
-
-  // TODO: Add Salesforce API push logic here using jsforce
 
   res.json({
     canvas: {
@@ -84,3 +88,4 @@ app.post('/intercom/submit', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+
