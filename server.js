@@ -69,13 +69,41 @@ function buildRefundForm(values = {}, successMessage = null) {
     },
 
     { type: "input", id: "delivery_order_id", label: "Delivery Order ID", value: values.delivery_order_id || "" },
-    { type: "input", id: "delivery_partner", label: "Delivery Partner", value: values.delivery_partner || "" },
+    
+    // Dropdown Component for Delivery Partner
+    {
+      type: "dropdown",
+      id: "delivery_partner",
+      label: "Delivery Partner",
+      options: [
+        { type: "option", id: "", text: "-- Select --" },
+        { type: "option", id: "DoorDash", text: "DoorDash" },
+        { type: "option", id: "UberEats", text: "UberEats" },
+        { type: "option", id: "Other", text: "Other" }
+      ],
+      value: values.delivery_partner || ""
+    },
+
     { type: "input", id: "dispute_id", label: "Dispute ID", value: values.dispute_id || "" },
     { type: "input", id: "amount_issued_account", label: "Amount Issued to Customer (Account)", value: values.amount_issued_account || "" },
     { type: "input", id: "amount_issued_guest", label: "Amount Issued to Guest", value: values.amount_issued_guest || "" },
     { type: "textarea", id: "refund_reason_notes", label: "Refund Reason Notes", value: values.refund_reason_notes || "" },
     { type: "input", id: "third_party_reimbursement_amount", label: "3rd Party Reimbursement Amount", value: values.third_party_reimbursement_amount || "" },
-    { type: "input", id: "third_party_reimbursement_status", label: "3rd Party Reimbursement Status", value: values.third_party_reimbursement_status || "" },
+    
+    // Dropdown Component for 3rd Party Reimbursement Status
+    {
+      type: "dropdown",
+      id: "third_party_reimbursement_status",
+      label: "3rd Party Reimbursement Status",
+      options: [
+        { type: "option", id: "", text: "-- Select --" },
+        { type: "option", id: "Approved", text: "Approved" },
+        { type: "option", id: "Denied", text: "Denied" },
+        { type: "option", id: "N/A", text: "N/A" }
+      ],
+      value: values.third_party_reimbursement_status || ""
+    },
+
     { type: "input", id: "stripe_reimbursement_link", label: "Stripe Reimbursement Link", value: values.stripe_reimbursement_link || "" },
     
     // Dropdown Component for Refund Complete
@@ -153,8 +181,7 @@ app.post('/intercom/submit', async (req, res) => {
 
   } catch (error) {
     console.error("Salesforce Push Error:", error);
-    // Reset connection if authentication failed
-    sfConn = null;
+    sfConn = null; // Reset connection kapag nag-error
 
     res.json({
       canvas: {
@@ -168,3 +195,4 @@ app.post('/intercom/submit', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
