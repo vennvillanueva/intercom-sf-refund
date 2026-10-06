@@ -51,6 +51,10 @@ function buildRefundForm(values = {}, successMessage = null) {
   }
 
   components.push(
+    // 1. Order ID (Pinaka-unang field)
+    { type: "input", id: "order_id", label: "Order ID", value: values.order_id || "" },
+    
+    // 2. Date of Order
     { type: "input", id: "date_of_order", label: "Date of Order", value: values.date_of_order || "", placeholder: "YYYY-MM-DD" },
     { type: "input", id: "guest_name", label: "Guest Name", value: values.guest_name || "" },
     
@@ -140,6 +144,7 @@ app.post('/intercom/initialize', async (req, res) => {
 
       if (sfRecord) {
         existingValues = {
+          order_id: sfRecord.Order_ID__c || "",
           date_of_order: sfRecord.Date_of_Order__c || "",
           guest_name: sfRecord.Guest_Name__c || "",
           order_type: sfRecord.Order_Type__c || "Delivery",
@@ -180,6 +185,7 @@ app.post('/intercom/submit', async (req, res) => {
     const conn = await getSalesforceConnection();
 
     const sfData = {
+      Order_ID__c: inputs.order_id || null,
       Date_of_Order__c: inputs.date_of_order || null,
       Guest_Name__c: inputs.guest_name || null,
       Order_Type__c: inputs.order_type || null,
@@ -225,4 +231,3 @@ app.post('/intercom/submit', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
