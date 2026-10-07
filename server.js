@@ -367,8 +367,6 @@ app.post('/intercom/account-app/submit', async (req, res) => {
 
   inputs.sfCaseId = sfCaseId;
 
-  let updateNotice = null;
-
   try {
     const conn = await getSalesforceConnection();
 
@@ -434,18 +432,18 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       } catch (aErr) { console.error("Account Retrieve Error:", aErr.message); }
     }
 
-    // Determine Specific Update Notice Banner
-    if (clickedButton === "source") {
+    // STRICT DETERMINATION OF UPDATE NOTICE BANNER
+    let updateNotice = "✅ Salesforce ticket updated";
+
+    if (clickedButton === "source" || (inputs.source && !clickedButton)) {
       updateNotice = "✅ Source set to Salesforce ticket";
     } else if (clickedButton === "selected_contact_id" || clickedButton === "search_contact_btn") {
       updateNotice = "✅ Contact updated to Salesforce ticket";
     } else if (clickedButton === "selected_account_id" || clickedButton === "search_account_btn") {
       updateNotice = "✅ Account updated to Salesforce ticket";
-    } else if (inputs.source || inputs.selected_contact_id || inputs.selected_account_id) {
-      updateNotice = "✅ Salesforce ticket updated";
     }
 
-    // SAFE UPDATE DIRECTLY TO Source__c
+    // UPDATE Source__c DIRECTLY TO SALESFORCE CASE
     if (sfCaseId) {
       const sfData = {
         Id: sfCaseId,
@@ -484,3 +482,4 @@ app.post('/intercom/account-app/submit', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+
