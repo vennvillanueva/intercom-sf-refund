@@ -207,7 +207,7 @@ app.post('/intercom/initialize', async (req, res) => {
   res.json({ canvas: { content: { components: buildRefundForm(existingValues) } } });
 });
 
-// SUBMIT REFUND APP (With Safe Parsing & Notification Banner)
+// SUBMIT REFUND APP
 app.post('/intercom/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
   const sfCaseId = extractSfCaseId(req.body);
@@ -311,7 +311,8 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
       id: "selected_contact_id",
       label: "Select Matching Contact",
       options: contactDropdown,
-      value: values.selected_contact_id || contactDropdown[0].id
+      value: values.selected_contact_id || contactDropdown[0].id,
+      action: { type: "submit" } // Instant auto-save to Salesforce on selection change
     });
   }
 
@@ -339,7 +340,8 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
       id: "selected_account_id",
       label: "Select Matching Account",
       options: accountDropdown,
-      value: values.selected_account_id || accountDropdown[0].id
+      value: values.selected_account_id || accountDropdown[0].id,
+      action: { type: "submit" } // Instant auto-save to Salesforce on selection change
     });
   }
 
@@ -502,15 +504,19 @@ app.post('/intercom/account-app/submit', async (req, res) => {
     // STRICT DETERMINATION OF UPDATE NOTICE BANNER
     let updateNotice = "✅ Salesforce ticket updated";
 
-    if (clickedButton === "source" || (inputs.source && !clickedButton)) {
+    if (clickedButton === "source") {
       updateNotice = "✅ Source set to Salesforce ticket";
-    } else if (clickedButton === "selected_contact_id" || clickedButton === "search_contact_btn") {
+    } else if (clickedButton === "selected_contact_id") {
       updateNotice = "✅ Contact updated to Salesforce ticket";
-    } else if (clickedButton === "selected_account_id" || clickedButton === "search_account_btn") {
+    } else if (clickedButton === "selected_account_id") {
       updateNotice = "✅ Account updated to Salesforce ticket";
+    } else if (clickedButton === "search_contact_btn") {
+      updateNotice = "🔍 Select matching contact below";
+    } else if (clickedButton === "search_account_btn") {
+      updateNotice = "🔍 Select matching account below";
     }
 
-    // UPDATE Source__c DIRECTLY TO SALESFORCE CASE
+    // UPDATE Source__c, ContactId, AccountId DIRECTLY TO SALESFORCE CASE
     if (sfCaseId) {
       const sfData = {
         Id: sfCaseId,
@@ -523,7 +529,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       }
 
       await conn.sobject('Case').update(sfData);
-      console.log(`Auto-synced Case ${sfCaseId} with Source: ${inputs.source}`);
+      console.log(`Auto-synced Case ${sfCaseId} with Contact: ${inputs.selected_contact_id}, Account: ${inputs.selected_account_id}, Source: ${inputs.source}`);
     }
 
     res.json({
