@@ -177,12 +177,11 @@ app.post('/intercom/submit', async (req, res) => {
 
 
 // ==========================================
-// APP 2: SALESFORCE CASE MANAGER (AUTO-SAVE FLOW)
+// APP 2: SALESFORCE CASE MANAGER
 // ==========================================
 function buildAccountContactUI(values = {}, options = {}, message = null) {
   const components = [];
 
-  // Success / Auto-save Indicator Banner
   if (message) {
     components.push({
       type: "text",
@@ -231,7 +230,6 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     });
   }
 
-  // Contact Details Display
   components.push(
     { type: "text", text: `*Contact Email:* ${values.contact_email || 'N/A'}`, style: "paragraph" },
     { type: "text", text: `*Contact Phone:* ${values.contact_phone || 'N/A'}`, style: "paragraph" },
@@ -260,7 +258,6 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     });
   }
 
-  // Read-only Account Data Display
   components.push(
     { type: "text", text: `*Account Status:* ${values.account_status || 'N/A'}`, style: "paragraph" },
     { type: "text", text: `*Partner Level:* ${values.partner_level || 'N/A'}`, style: "paragraph" },
@@ -270,7 +267,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     { type: "divider" }
   );
 
-  // 4. SOURCE DROPDOWN FIELD (Auto-saves upon change)
+  // 4. SOURCE DROPDOWN FIELD
   components.push({
     type: "dropdown",
     id: "source",
@@ -369,7 +366,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
     let contactList = [];
     let accountList = [];
 
-    // 1. SEARCH CONTACT BUTTON CLICKED
+    // 1. ACTION: SEARCH CONTACT BUTTON CLICKED
     if (clickedButton === "search_contact_btn") {
       const searchTerm = (inputs.contact_search_term || "").trim();
       if (searchTerm) {
@@ -382,7 +379,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       }
     }
 
-    // 2. SEARCH ACCOUNT BUTTON CLICKED
+    // 2. ACTION: SEARCH ACCOUNT BUTTON CLICKED
     if (clickedButton === "search_account_btn") {
       const searchTerm = (inputs.account_search_term || "").trim();
       if (searchTerm) {
@@ -395,7 +392,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       }
     }
 
-    // 3. AUTO-FETCH CONTACT & ACCOUNT DATA
+    // 3. INDEPENDENT CONTACT RETRIEVAL (Pinoprotektahan ang Contact Data kahit nag-Search ng Account)
     if (inputs.selected_contact_id) {
       try {
         const targetContact = await conn.sobject('Contact').retrieve(inputs.selected_contact_id);
@@ -404,7 +401,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
           inputs.contact_phone = targetContact.Phone || "N/A";
           inputs.contact_status = targetContact.Contact_Status__c || "N/A";
 
-          // If searching/selecting Contact for the first time, auto-select its primary Account
+          // Auto-set Account ID LAMANG kapag unang beses nag-search ng Contact
           if (clickedButton === "search_contact_btn" && targetContact.AccountId) {
             inputs.selected_account_id = targetContact.AccountId;
           }
@@ -412,6 +409,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       } catch (cErr) { console.error("Contact Retrieve Error:", cErr.message); }
     }
 
+    // 4. INDEPENDENT ACCOUNT RETRIEVAL
     if (inputs.selected_account_id) {
       try {
         const targetAcc = await conn.sobject('Account').retrieve(inputs.selected_account_id);
@@ -427,23 +425,17 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       } catch (aErr) { console.error("Account Retrieve Error:", aErr.message); }
     }
 
-    // 4. AUTOMATICALLY PUSH / SAVE UPDATES TO SALESFORCE CASE
-    const sfData = {
-      Source__c: inputs.source || null
-    };
-
-    if (inputs.selected_contact_id) {
-      sfData.ContactId = inputs.selected_contact_id;
-    }
-
-    if (inputs.selected_account_id) {
-      sfData.AccountId = inputs.selected_account_id;
-    }
-
+    // 5. UPDATE SALESFORCE CASE TICKET (Updates Contact, Account, and Source__c)
     if (sfCaseId) {
-      sfData.Id = sfCaseId;
+      const sfData = {
+        Id: sfCaseId,
+        Source__c: inputs.source || null,
+        ContactId: inputs.selected_contact_id || null,
+        AccountId: inputs.selected_account_id || null
+      };
+
       await conn.sobject('Case').update(sfData);
-      console.log(`Auto-saved Case Update ${sfCaseId} in Salesforce`);
+      console.log(`Auto-synced Case ${sfCaseId} with Source: ${inputs.source}, Contact: ${inputs.selected_contact_id}, Account: ${inputs.selected_account_id}`);
     }
 
     res.json({
@@ -469,3 +461,4 @@ app.post('/intercom/account-app/submit', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
