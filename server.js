@@ -298,7 +298,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
   return components;
 }
 
-// INITIALIZE FLOW (Robust Search across all possible Salesforce Case ID locations)
+// INITIALIZE FLOW (Identical to Refund logic: Single Direct SOQL Query for Case + Contact + Account)
 app.post('/intercom/account-app/initialize', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
 
@@ -309,50 +309,34 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
   if (sfCaseId) {
     try {
       const conn = await getSalesforceConnection();
-      const sfCase = await conn.sobject('Case').retrieve(sfCaseId);
+      const query = `SELECT Id, Source__c, ContactId, Contact.Name, Contact.Email, Contact.Phone, Contact.Contact_Status__c, AccountId, Account.Name, Account.Account_Status__c, Account.Partner_Level__c, Account.Website, Account.Dashboard_URL__c, Account.BillingAddress FROM Case WHERE Id = '${sfCaseId}' LIMIT 1`;
+      const result = await conn.query(query);
 
-      if (sfCase) {
+      if (result.records && result.records.length > 0) {
+        const sfCase = result.records[0];
         initialValues.source = sfCase.Source__c || "";
-        initialValues.selected_contact_id = sfCase.ContactId || "";
-        initialValues.selected_account_id = sfCase.AccountId || "";
 
-        const fetchPromises = [];
-
-        if (sfCase.ContactId) {
-          fetchPromises.push(
-            conn.sobject('Contact').retrieve(sfCase.ContactId)
-              .then(c => {
-                if (c) {
-                  contactList = [c];
-                  initialValues.contact_search_term = c.Name || "";
-                  initialValues.contact_email = c.Email || "N/A";
-                  initialValues.contact_phone = c.Phone || "N/A";
-                  initialValues.contact_status = c.Contact_Status__c || "N/A";
-                }
-              }).catch(e => console.error("Init Contact Error:", e.message))
-          );
+        if (sfCase.Contact) {
+          initialValues.selected_contact_id = sfCase.ContactId || "";
+          initialValues.contact_search_term = sfCase.Contact.Name || "";
+          initialValues.contact_email = sfCase.Contact.Email || "N/A";
+          initialValues.contact_phone = sfCase.Contact.Phone || "N/A";
+          initialValues.contact_status = sfCase.Contact.Contact_Status__c || "N/A";
+          contactList = [{ Id: sfCase.ContactId, Name: sfCase.Contact.Name, Email: sfCase.Contact.Email, Phone: sfCase.Contact.Phone }];
         }
 
-        if (sfCase.AccountId) {
-          fetchPromises.push(
-            conn.sobject('Account').retrieve(sfCase.AccountId)
-              .then(a => {
-                if (a) {
-                  accountList = [a];
-                  initialValues.account_search_term = a.Name || "";
-                  initialValues.account_status = a.Account_Status__c || "N/A";
-                  initialValues.partner_level = a.Partner_Level__c || "N/A";
-                  initialValues.website = a.Website || "N/A";
-                  initialValues.dashboard_url = a.Dashboard_URL__c || "N/A";
-                  initialValues.billing_address = formatAddress(a.BillingAddress);
-                }
-              }).catch(e => console.error("Init Account Error:", e.message))
-          );
+        if (sfCase.Account) {
+          initialValues.selected_account_id = sfCase.AccountId || "";
+          initialValues.account_search_term = sfCase.Account.Name || "";
+          initialValues.account_status = sfCase.Account.Account_Status__c || "N/A";
+          initialValues.partner_level = sfCase.Account.Partner_Level__c || "N/A";
+          initialValues.website = sfCase.Account.Website || "N/A";
+          initialValues.dashboard_url = sfCase.Account.Dashboard_URL__c || "N/A";
+          initialValues.billing_address = formatAddress(sfCase.Account.BillingAddress);
+          accountList = [{ Id: sfCase.AccountId, Name: sfCase.Account.Name }];
         }
-
-        await Promise.all(fetchPromises);
       }
-    } catch (err) { console.error("Case Manager Initialize Error:", err.message); }
+    } catch (err) { console.error("Case Manager Direct Query Initialize Error:", err.message); }
   }
 
   res.json({
