@@ -11,11 +11,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// Reusable JSForce Connection
+// Reusable JSForce Connection Instance
 let sfConn = null;
 
 async function getSalesforceConnection() {
-  if (sfConn && sfConn.accessToken && sfConn.instanceUrl && sfConn.instanceUrl.startsWith('http')) {
+  if (sfConn && sfConn.accessToken && sfConn.instanceUrl && typeof sfConn.instanceUrl === 'string' && sfConn.instanceUrl.startsWith('http')) {
     return sfConn;
   }
   
@@ -24,21 +24,26 @@ async function getSalesforceConnection() {
     loginUrl = `https://${loginUrl}`;
   }
   
-  sfConn = new jsforce.Connection({
-    loginUrl: loginUrl,
-    version: '57.0'
-  });
+  try {
+    sfConn = new jsforce.Connection({
+      loginUrl: loginUrl,
+      version: '57.0'
+    });
 
-  await sfConn.login(
-    process.env.SF_USERNAME,
-    process.env.SF_PASSWORD + process.env.SF_SECURITY_TOKEN
-  );
+    await sfConn.login(
+      process.env.SF_USERNAME,
+      process.env.SF_PASSWORD + process.env.SF_SECURITY_TOKEN
+    );
 
-  if (sfConn.instanceUrl && !sfConn.instanceUrl.startsWith('http')) {
-    sfConn.instanceUrl = `https://${sfConn.instanceUrl}`;
+    if (sfConn.instanceUrl && !sfConn.instanceUrl.startsWith('http')) {
+      sfConn.instanceUrl = `https://${sfConn.instanceUrl}`;
+    }
+
+    return sfConn;
+  } catch (err) {
+    sfConn = null;
+    throw err;
   }
-
-  return sfConn;
 }
 
 function formatAddress(addr) {
@@ -61,7 +66,7 @@ function extractSfCaseId(body) {
       || body.user?.custom_attributes?.salesforce_case_id;
 }
 
-// Helper to safely parse float inputs without returning NaN
+// Safe float conversion function
 function safeParseFloat(val) {
   if (!val || val === "") return null;
   const parsed = parseFloat(val);
@@ -154,49 +159,27 @@ app.post('/intercom/initialize', async (req, res) => {
   if (sfCaseId) {
     try {
       const conn = await getSalesforceConnection();
-      try {
-        const query = `SELECT Order_ID__c, Date_of_Order__c, Guest_Name__c, Order_Type__c, Delivery_Order_ID__c, Delivery_Partner__c, Dispute_ID__c, Amount_Issued_to_Customer_Account__c, Amount_Issued_to_Guest__c, Refund_Reason_Notes__c, Third_Party_Reimbursement_Amount__c, Third_Party_Reimbursement_Status__c, Stripe_Reimbursement_Link__c, Refund_Complete__c FROM Case WHERE Id = '${sfCaseId}' LIMIT 1`;
-        const result = await conn.query(query);
-        if (result.records && result.records.length > 0) {
-          const sfRecord = result.records[0];
-          existingValues = {
-            order_id: sfRecord.Order_ID__c || "",
-            date_of_order: sfRecord.Date_of_Order__c || "",
-            guest_name: sfRecord.Guest_Name__c || "",
-            order_type: sfRecord.Order_Type__c || "Delivery",
-            delivery_order_id: sfRecord.Delivery_Order_ID__c || "",
-            delivery_partner: sfRecord.Delivery_Partner__c || "",
-            dispute_id: sfRecord.Dispute_ID__c || "",
-            amount_issued_account: sfRecord.Amount_Issued_to_Customer_Account__c != null ? String(sfRecord.Amount_Issued_to_Customer_Account__c) : "",
-            amount_issued_guest: sfRecord.Amount_Issued_to_Guest__c != null ? String(sfRecord.Amount_Issued_to_Guest__c) : "",
-            refund_reason_notes: sfRecord.Refund_Reason_Notes__c || "",
-            third_party_reimbursement_amount: sfRecord.Third_Party_Reimbursement_Amount__c != null ? String(sfRecord.Third_Party_Reimbursement_Amount__c) : "",
-            third_party_reimbursement_status: sfRecord.Third_Party_Reimbursement_Status__c || "",
-            stripe_reimbursement_link: sfRecord.Stripe_Reimbursement_Link__c || "",
-            refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
-          };
-        }
-      } catch (queryErr) {
-        console.error("Refund App SOQL Query Fallback:", queryErr.message);
-        const sfRecord = await conn.sobject('Case').retrieve(sfCaseId);
-        if (sfRecord) {
-          existingValues = {
-            order_id: sfRecord.Order_ID__c || "",
-            date_of_order: sfRecord.Date_of_Order__c || "",
-            guest_name: sfRecord.Guest_Name__c || "",
-            order_type: sfRecord.Order_Type__c || "Delivery",
-            delivery_order_id: sfRecord.Delivery_Order_ID__c || "",
-            delivery_partner: sfRecord.Delivery_Partner__c || "",
-            dispute_id: sfRecord.Dispute_ID__c || "",
-            amount_issued_account: sfRecord.Amount_Issued_to_Customer_Account__c ? String(sfRecord.Amount_Issued_to_Customer_Account__c) : "",
-            amount_issued_guest: sfRecord.Amount_Issued_to_Guest__c ? String(sfRecord.Amount_Issued_to_Guest__c) : "",
-            refund_reason_notes: sfRecord.Refund_Reason_Notes__c || "",
-            third_party_reimbursement_amount: sfRecord.Third_Party_Reimbursement_Amount__c ? String(sfRecord.Third_Party_Reimbursement_Amount__c) : "",
-            third_party_reimbursement_status: sfRecord.Third_Party_Reimbursement_Status__c || "",
-            stripe_reimbursement_link: sfRecord.Stripe_Reimbursement_Link__c || "",
-            refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
-          };
-        }
+      const query = `SELECT Order_ID__c, Date_of_Order__c, Guest_Name__c, Order_Type__c, Delivery_Order_ID__c, Delivery_Partner__c, Dispute_ID__c, Amount_Issued_to_Customer_Account__c, Amount_Issued_to_Guest__c, Refund_Reason_Notes__c, Third_Party_Reimbursement_Amount__c, Third_Party_Reimbursement_Status__c, Stripe_Reimbursement_Link__c, Refund_Complete__c FROM Case WHERE Id = '${sfCaseId}' LIMIT 1`;
+      const result = await conn.query(query);
+
+      if (result.records && result.records.length > 0) {
+        const sfRecord = result.records[0];
+        existingValues = {
+          order_id: sfRecord.Order_ID__c || "",
+          date_of_order: sfRecord.Date_of_Order__c || "",
+          guest_name: sfRecord.Guest_Name__c || "",
+          order_type: sfRecord.Order_Type__c || "Delivery",
+          delivery_order_id: sfRecord.Delivery_Order_ID__c || "",
+          delivery_partner: sfRecord.Delivery_Partner__c || "",
+          dispute_id: sfRecord.Dispute_ID__c || "",
+          amount_issued_account: sfRecord.Amount_Issued_to_Customer_Account__c != null ? String(sfRecord.Amount_Issued_to_Customer_Account__c) : "",
+          amount_issued_guest: sfRecord.Amount_Issued_to_Guest__c != null ? String(sfRecord.Amount_Issued_to_Guest__c) : "",
+          refund_reason_notes: sfRecord.Refund_Reason_Notes__c || "",
+          third_party_reimbursement_amount: sfRecord.Third_Party_Reimbursement_Amount__c != null ? String(sfRecord.Third_Party_Reimbursement_Amount__c) : "",
+          third_party_reimbursement_status: sfRecord.Third_Party_Reimbursement_Status__c || "",
+          stripe_reimbursement_link: sfRecord.Stripe_Reimbursement_Link__c || "",
+          refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
+        };
       }
     } catch (err) { 
       console.error("Refund App Initialize Error:", err.message); 
@@ -312,7 +295,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
       label: "Select Matching Contact",
       options: contactDropdown,
       value: values.selected_contact_id || contactDropdown[0].id,
-      action: { type: "submit" } // Instant auto-save to Salesforce on selection change
+      action: { type: "submit" }
     });
   }
 
@@ -341,7 +324,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
       label: "Select Matching Account",
       options: accountDropdown,
       value: values.selected_account_id || accountDropdown[0].id,
-      action: { type: "submit" } // Instant auto-save to Salesforce on selection change
+      action: { type: "submit" }
     });
   }
 
@@ -516,7 +499,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       updateNotice = "🔍 Select matching account below";
     }
 
-    // UPDATE Source__c, ContactId, AccountId DIRECTLY TO SALESFORCE CASE
+    // UPDATE Source__c DIRECTLY TO SALESFORCE CASE
     if (sfCaseId) {
       const sfData = {
         Id: sfCaseId,
@@ -529,7 +512,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       }
 
       await conn.sobject('Case').update(sfData);
-      console.log(`Auto-synced Case ${sfCaseId} with Contact: ${inputs.selected_contact_id}, Account: ${inputs.selected_account_id}, Source: ${inputs.source}`);
+      console.log(`Auto-synced Case ${sfCaseId} with Source: ${inputs.source}`);
     }
 
     res.json({
