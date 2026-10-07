@@ -288,63 +288,70 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
   return components;
 }
 
+// INITIALIZE FLOW
 app.post('/intercom/account-app/initialize', async (req, res) => {
   const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
                 || req.body.custom_attributes?.salesforce_id
                 || req.body.customer?.custom_attributes?.salesforce_id;
 
-  const sfAccountId = req.body.conversation?.custom_attributes?.salesforce_account_id 
-                   || req.body.custom_attributes?.salesforce_account_id
-                   || req.body.customer?.custom_attributes?.salesforce_account_id;
-
   let initialValues = { sfCaseId };
+  let contactList = [];
+  let accountList = [];
 
-  try {
-    const conn = await getSalesforceConnection();
+  if (sfCaseId) {
+    try {
+      const conn = await getSalesforceConnection();
+      const sfCase = await conn.sobject('Case').retrieve(sfCaseId);
 
-    if (sfCaseId) {
-      try {
-        const sfCase = await conn.sobject('Case').retrieve(sfCaseId);
-        if (sfCase) {
-          initialValues.source = sfCase.Source__c || "";
-          initialValues.selected_contact_id = sfCase.ContactId || "";
+      if (sfCase) {
+        initialValues.source = sfCase.Source__c || "";
+        initialValues.selected_contact_id = sfCase.ContactId || "";
+        initialValues.selected_account_id = sfCase.AccountId || "";
 
-          if (sfCase.ContactId) {
-            const contactRec = await conn.sobject('Contact').retrieve(sfCase.ContactId);
-            if (contactRec) {
-              initialValues.contact_email = contactRec.Email || "N/A";
-              initialValues.contact_phone = contactRec.Phone || "N/A";
-              initialValues.contact_status = contactRec.Contact_Status__c || "N/A";
-              initialValues.contact_search_term = contactRec.Name || "";
-            }
-          }
+        // Safe parallel fetch
+        const fetchPromises = [];
+
+        if (sfCase.ContactId) {
+          fetchPromises.push(
+            conn.sobject('Contact').retrieve(sfCase.ContactId)
+              .then(c => {
+                if (c) {
+                  contactList = [c];
+                  initialValues.contact_search_term = c.Name || "";
+                  initialValues.contact_email = c.Email || "N/A";
+                  initialValues.contact_phone = c.Phone || "N/A";
+                  initialValues.contact_status = c.Contact_Status__c || "N/A";
+                }
+              }).catch(e => console.error("Init Contact Error:", e.message))
+          );
         }
-      } catch (caseErr) { console.error("Case Retrieve Error:", caseErr.message); }
-    }
 
-    if (sfAccountId) {
-      try {
-        const sfAccount = await conn.sobject('Account').retrieve(sfAccountId);
-        if (sfAccount) {
-          initialValues = {
-            ...initialValues,
-            account_search_term: sfAccount.Name || "",
-            account_status: sfAccount.Account_Status__c || "N/A",
-            partner_level: sfAccount.Partner_Level__c || "N/A",
-            website: sfAccount.Website || "N/A",
-            dashboard_url: sfAccount.Dashboard_URL__c || "N/A",
-            billing_address: formatAddress(sfAccount.BillingAddress),
-            selected_account_id: sfAccountId
-          };
+        if (sfCase.AccountId) {
+          fetchPromises.push(
+            conn.sobject('Account').retrieve(sfCase.AccountId)
+              .then(a => {
+                if (a) {
+                  accountList = [a];
+                  initialValues.account_search_term = a.Name || "";
+                  initialValues.account_status = a.Account_Status__c || "N/A";
+                  initialValues.partner_level = a.Partner_Level__c || "N/A";
+                  initialValues.website = a.Website || "N/A";
+                  initialValues.dashboard_url = a.Dashboard_URL__c || "N/A";
+                  initialValues.billing_address = formatAddress(a.BillingAddress);
+                }
+              }).catch(e => console.error("Init Account Error:", e.message))
+          );
         }
-      } catch (accErr) { console.error("Account Retrieve Error:", accErr.message); }
-    }
-  } catch (err) { console.error("Initialize Error:", err.message); }
+
+        await Promise.all(fetchPromises);
+      }
+    } catch (err) { console.error("Case Manager Initialize Error:", err.message); }
+  }
 
   res.json({
     canvas: {
       content: {
-        components: buildAccountContactUI(initialValues)
+        components: buildAccountContactUI(initialValues, { contactList, accountList })
       }
     }
   });
@@ -366,7 +373,6 @@ app.post('/intercom/account-app/submit', async (req, res) => {
     let contactList = [];
     let accountList = [];
 
-    // 1. ACTION: SEARCH CONTACT BUTTON CLICKED
     if (clickedButton === "search_contact_btn") {
       const searchTerm = (inputs.contact_search_term || "").trim();
       if (searchTerm) {
@@ -379,7 +385,6 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       }
     }
 
-    // 2. ACTION: SEARCH ACCOUNT BUTTON CLICKED
     if (clickedButton === "search_account_btn") {
       const searchTerm = (inputs.account_search_term || "").trim();
       if (searchTerm) {
@@ -392,16 +397,15 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       }
     }
 
-    // 3. INDEPENDENT CONTACT RETRIEVAL (Pinoprotektahan ang Contact Data kahit nag-Search ng Account)
     if (inputs.selected_contact_id) {
       try {
         const targetContact = await conn.sobject('Contact').retrieve(inputs.selected_contact_id);
         if (targetContact) {
+          if (contactList.length === 0) contactList = [targetContact];
           inputs.contact_email = targetContact.Email || "N/A";
           inputs.contact_phone = targetContact.Phone || "N/A";
           inputs.contact_status = targetContact.Contact_Status__c || "N/A";
 
-          // Auto-set Account ID LAMANG kapag unang beses nag-search ng Contact
           if (clickedButton === "search_contact_btn" && targetContact.AccountId) {
             inputs.selected_account_id = targetContact.AccountId;
           }
@@ -409,12 +413,11 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       } catch (cErr) { console.error("Contact Retrieve Error:", cErr.message); }
     }
 
-    // 4. INDEPENDENT ACCOUNT RETRIEVAL
     if (inputs.selected_account_id) {
       try {
         const targetAcc = await conn.sobject('Account').retrieve(inputs.selected_account_id);
         if (targetAcc) {
-          accountList = [targetAcc];
+          if (accountList.length === 0) accountList = [targetAcc];
           inputs.account_search_term = targetAcc.Name;
           inputs.account_status = targetAcc.Account_Status__c || "N/A";
           inputs.partner_level = targetAcc.Partner_Level__c || "N/A";
@@ -425,7 +428,6 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       } catch (aErr) { console.error("Account Retrieve Error:", aErr.message); }
     }
 
-    // 5. UPDATE SALESFORCE CASE TICKET (Updates Contact, Account, and Source__c)
     if (sfCaseId) {
       const sfData = {
         Id: sfCaseId,
@@ -435,7 +437,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       };
 
       await conn.sobject('Case').update(sfData);
-      console.log(`Auto-synced Case ${sfCaseId} with Source: ${inputs.source}, Contact: ${inputs.selected_contact_id}, Account: ${inputs.selected_account_id}`);
+      console.log(`Auto-synced Case ${sfCaseId}`);
     }
 
     res.json({
@@ -459,6 +461,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
   }
 });
 
+// Explicit host '0.0.0.0' for instant Render port discovery
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
 
