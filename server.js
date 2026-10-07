@@ -11,40 +11,60 @@ app.use((req, res, next) => {
   next();
 });
 
-// Reusable JSForce Connection Instance
-let sfConn = null;
+// ==========================================
+// SALESFORCE CONNECTION (race-condition safe)
+// ==========================================
+let sfConn = null;        // fully logged-in connection lang ang nandito
+let loginPromise = null;  // kapag may nagla-login na, doon lahat sasabay
+
+function sfBaseUrl() {
+  let url = process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com';
+  if (!url.startsWith('http')) url = `https://${url}`;
+  return url.replace(/\/+$/, '');
+}
 
 async function getSalesforceConnection() {
-  if (sfConn && sfConn.accessToken && sfConn.instanceUrl && typeof sfConn.instanceUrl === 'string' && sfConn.instanceUrl.startsWith('http')) {
-    return sfConn;
-  }
-  
-  let loginUrl = process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com';
-  if (!loginUrl.startsWith('http')) {
-    loginUrl = `https://${loginUrl}`;
-  }
-  
-  try {
-    sfConn = new jsforce.Connection({
-      loginUrl: loginUrl,
-      version: '57.0'
-    });
+  if (sfConn) return sfConn;
+  if (loginPromise) return loginPromise; // iisang login lang kahit sabay-sabay ang requests
 
-    await sfConn.login(
+  loginPromise = (async () => {
+    const conn = new jsforce.Connection({ loginUrl: sfBaseUrl(), version: '57.0' });
+    await conn.login(
       process.env.SF_USERNAME,
       process.env.SF_PASSWORD + process.env.SF_SECURITY_TOKEN
     );
-
-    if (sfConn.instanceUrl && !sfConn.instanceUrl.startsWith('http')) {
-      sfConn.instanceUrl = `https://${sfConn.instanceUrl}`;
+    if (conn.instanceUrl && !conn.instanceUrl.startsWith('http')) {
+      conn.instanceUrl = `https://${conn.instanceUrl}`;
     }
+    sfConn = conn; // i-set lang kapag tapos na ang login
+    console.log('Salesforce login OK:', conn.instanceUrl);
+    return conn;
+  })().finally(() => { loginPromise = null; });
 
-    return sfConn;
+  return loginPromise;
+}
+
+// Gamitin ito sa LAHAT ng SF calls. May isang auto-retry kapag expired/sira ang session.
+async function withSf(fn) {
+  let conn = await getSalesforceConnection();
+  try {
+    return await fn(conn);
   } catch (err) {
-    sfConn = null;
+    const msg = err && err.message ? err.message : '';
+    if (err.errorCode === 'INVALID_SESSION_ID' || /session|Failed to parse URL/i.test(msg)) {
+      if (sfConn === conn) sfConn = null; // i-reset lang kung ito pa rin ang global
+      conn = await getSalesforceConnection();
+      return await fn(conn);
+    }
     throw err;
   }
 }
+
+// ==========================================
+// HELPERS
+// ==========================================
+const esc = s => String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+const isSfId = s => /^[a-zA-Z0-9]{15,18}$/.test(s || '');
 
 function formatAddress(addr) {
   if (!addr) return "N/A";
@@ -53,9 +73,8 @@ function formatAddress(addr) {
   return parts.length > 0 ? parts.join(', ') : "N/A";
 }
 
-// Robust extractor for Salesforce Case ID across all possible Intercom payload paths
 function extractSfCaseId(body) {
-  return body.conversation?.custom_attributes?.salesforce_id
+  const id = body.conversation?.custom_attributes?.salesforce_id
       || body.conversation?.custom_attributes?.salesforce_case_id
       || body.conversation?.custom_attributes?.sf_case_id
       || body.custom_attributes?.salesforce_id
@@ -64,33 +83,93 @@ function extractSfCaseId(body) {
       || body.customer?.custom_attributes?.salesforce_case_id
       || body.user?.custom_attributes?.salesforce_id
       || body.user?.custom_attributes?.salesforce_case_id;
+  return isSfId(id) ? id : undefined;
 }
 
-// Safe float conversion function
 function safeParseFloat(val) {
-  if (!val || val === "") return null;
+  if (val === undefined || val === null || val === "") return null;
   const parsed = parseFloat(val);
   return isNaN(parsed) ? null : parsed;
 }
 
-// BULLETPROOF CASE FETCH: Returns safe nulls for missing or invalid columns
-async function fetchCaseDetailsSafely(sfCaseId) {
-  const conn = await getSalesforceConnection();
-  let caseData = {};
+const str = v => (v === undefined || v === null) ? "" : String(v);
 
-  try {
-    // Excluded non-existent Third_Party_Reimbursement_Amount__c to guarantee SOQL success
-    const query = `SELECT Id, Source__c, ContactId, AccountId, Order_ID__c, Date_of_Order__c, Guest_Name__c, Order_Type__c, Delivery_Order_ID__c, Delivery_Partner__c, Dispute_ID__c, Amount_Issued_to_Customer_Account__c, Amount_Issued_to_Guest__c, Refund_Reason_Notes__c, Third_Party_Reimbursement_Status__c, Stripe_Reimbursement_Link__c, Refund_Complete__c FROM Case WHERE Id = '${sfCaseId}' LIMIT 1`;
-    const res = await conn.query(query);
-    if (res.records && res.records.length > 0) {
-      caseData = res.records[0];
-    }
-  } catch (e) {
-    console.error("Safe Case Query Fallback activated:", e.message);
-    caseData = await conn.sobject('Case').retrieve(sfCaseId).catch(() => ({})) || {};
+// ==========================================
+// CASE FIELD RESOLUTION (describe-based)
+// Hindi na hardcoded ang query. Mga field na talagang existing
+// (at may access) lang ang isasama, kaya hindi na masisira
+// ang buong form dahil sa isang maling field name.
+// ==========================================
+const REFUND_FIELDS = {
+  order_id:                         { names: ['Order_ID__c'] },
+  date_of_order:                    { names: ['Date_of_Order__c'] },
+  guest_name:                       { names: ['Guest_Name__c'] },
+  order_type:                       { names: ['Order_Type__c'] },
+  delivery_order_id:                { names: ['Delivery_Order_ID__c'] },
+  delivery_partner:                 { names: ['Delivery_Partner__c'] },
+  dispute_id:                       { names: ['Dispute_ID__c'] },
+  amount_issued_account:            { names: ['Amount_Issued_to_Customer_Account__c'], numeric: true },
+  amount_issued_guest:              { names: ['Amount_Issued_to_Guest__c'], numeric: true },
+  refund_reason_notes:              { names: ['Refund_Reason_Notes__c'] },
+  third_party_reimbursement_amount: {
+    names: ['Third_Party_Reimbursement_Amount__c', 'X3rd_Party_Reimbursement_Amount__c', 'X3rd_Party_Reimbursement_Amt__c', 'Third_Party_Reimbursement_Amt__c'],
+    match: /(3rd|third).*party.*reimburs.*(amount|amt)/i,
+    numeric: true
+  },
+  third_party_reimbursement_status: {
+    names: ['Third_Party_Reimbursement_Status__c', 'X3rd_Party_Reimbursement_Status__c'],
+    match: /(3rd|third).*party.*reimburs.*status/i
+  },
+  stripe_reimbursement_link:        { names: ['Stripe_Reimbursement_Link__c'], match: /stripe.*reimburs/i },
+  refund_complete:                  { names: ['Refund_Complete__c'], boolean: true }
+};
+
+let caseMeta = null;
+let caseMetaPromise = null;
+
+async function loadCaseFieldMeta() {
+  if (caseMeta) return caseMeta;
+  if (!caseMetaPromise) {
+    caseMetaPromise = withSf(conn => conn.sobject('Case').describe())
+      .then(desc => {
+        const byLower = new Map();
+        desc.fields.forEach(f => byLower.set(f.name.toLowerCase(), f));
+
+        const resolved = {};
+        for (const [key, def] of Object.entries(REFUND_FIELDS)) {
+          let f = null;
+          for (const n of def.names) {
+            f = byLower.get(n.toLowerCase());
+            if (f) break;
+          }
+          if (!f && def.match) f = desc.fields.find(x => def.match.test(x.name));
+          if (f) resolved[key] = f;
+          else console.warn(`⚠️ Walang nahanap na SF field para sa "${key}" (tinry: ${def.names.join(', ')})`);
+        }
+
+        const hints = desc.fields.filter(f => /reimburs|stripe/i.test(f.name)).map(f => f.name);
+        console.log('Case fields na may "reimburs/stripe":', hints.join(', ') || '(wala)');
+
+        caseMeta = { byLower, resolved };
+        return caseMeta;
+      })
+      .catch(err => { caseMetaPromise = null; throw err; });
   }
+  return caseMetaPromise;
+}
 
-  return caseData;
+async function fetchCase(sfCaseId) {
+  const meta = await loadCaseFieldMeta();
+  const fields = new Set(['Id']);
+  ['Source__c', 'ContactId', 'AccountId'].forEach(n => {
+    const f = meta.byLower.get(n.toLowerCase());
+    if (f) fields.add(f.name);
+  });
+  Object.values(meta.resolved).forEach(f => fields.add(f.name));
+
+  const soql = `SELECT ${[...fields].join(', ')} FROM Case WHERE Id = '${esc(sfCaseId)}' LIMIT 1`;
+  const result = await withSf(conn => conn.query(soql));
+  return (result.records && result.records[0]) || null;
 }
 
 // ==========================================
@@ -100,11 +179,7 @@ function buildRefundForm(values = {}, message = null) {
   const components = [];
 
   if (message) {
-    components.push({
-      type: "text",
-      text: message,
-      style: "header"
-    });
+    components.push({ type: "text", text: message, style: "header" });
   }
 
   components.push(
@@ -174,36 +249,46 @@ function buildRefundForm(values = {}, message = null) {
 // INITIALIZE REFUND APP
 app.post('/intercom/initialize', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
+  console.log('REFUND INIT sfCaseId =', sfCaseId, '| conv id =', req.body.conversation?.id);
+
   let existingValues = {};
+  let notice = null;
 
   if (sfCaseId) {
     try {
-      const sfRecord = await fetchCaseDetailsSafely(sfCaseId);
-      if (sfRecord && sfRecord.Id) {
+      const meta = await loadCaseFieldMeta();
+      const rec = await fetchCase(sfCaseId);
+      if (rec) {
+        const R = meta.resolved;
+        const get = k => (R[k] ? rec[R[k].name] : undefined);
+
+        const rc = get('refund_complete');
         existingValues = {
-          order_id: sfRecord.Order_ID__c || "",
-          date_of_order: sfRecord.Date_of_Order__c || "",
-          guest_name: sfRecord.Guest_Name__c || "",
-          order_type: sfRecord.Order_Type__c || "Delivery",
-          delivery_order_id: sfRecord.Delivery_Order_ID__c || "",
-          delivery_partner: sfRecord.Delivery_Partner__c || "",
-          dispute_id: sfRecord.Dispute_ID__c || "",
-          amount_issued_account: sfRecord.Amount_Issued_to_Customer_Account__c != null ? String(sfRecord.Amount_Issued_to_Customer_Account__c) : "",
-          amount_issued_guest: sfRecord.Amount_Issued_to_Guest__c != null ? String(sfRecord.Amount_Issued_to_Guest__c) : "",
-          refund_reason_notes: sfRecord.Refund_Reason_Notes__c || "",
-          third_party_reimbursement_amount: "",
-          third_party_reimbursement_status: sfRecord.Third_Party_Reimbursement_Status__c || "",
-          stripe_reimbursement_link: sfRecord.Stripe_Reimbursement_Link__c || "",
-          refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
+          order_id: str(get('order_id')),
+          date_of_order: str(get('date_of_order')),
+          guest_name: str(get('guest_name')),
+          order_type: str(get('order_type')) || "Delivery",
+          delivery_order_id: str(get('delivery_order_id')),
+          delivery_partner: str(get('delivery_partner')),
+          dispute_id: str(get('dispute_id')),
+          amount_issued_account: str(get('amount_issued_account')),
+          amount_issued_guest: str(get('amount_issued_guest')),
+          refund_reason_notes: str(get('refund_reason_notes')),
+          third_party_reimbursement_amount: str(get('third_party_reimbursement_amount')),
+          third_party_reimbursement_status: str(get('third_party_reimbursement_status')),
+          stripe_reimbursement_link: str(get('stripe_reimbursement_link')),
+          refund_complete: rc === true ? "Yes" : rc === false ? "No" : ""
         };
+      } else {
+        notice = "⚠️ Hindi nahanap ang Salesforce ticket";
       }
-    } catch (err) { 
-      console.error("Refund App Initialize Error:", err.message); 
-      sfConn = null;
+    } catch (err) {
+      console.error("Refund App Initialize Error:", err.message);
+      notice = `⚠️ Hindi ma-load ang data mula sa Salesforce: ${err.message}`;
     }
   }
 
-  res.json({ canvas: { content: { components: buildRefundForm(existingValues) } } });
+  res.json({ canvas: { content: { components: buildRefundForm(existingValues, notice) } } });
 });
 
 // SUBMIT REFUND APP
@@ -212,52 +297,44 @@ app.post('/intercom/submit', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
 
   try {
-    const conn = await getSalesforceConnection();
-    const sfData = {
-      Order_ID__c: inputs.order_id || null,
-      Date_of_Order__c: inputs.date_of_order || null,
-      Guest_Name__c: inputs.guest_name || null,
-      Order_Type__c: inputs.order_type || null,
-      Delivery_Order_ID__c: inputs.delivery_order_id || null,
-      Delivery_Partner__c: inputs.delivery_partner || null,
-      Dispute_ID__c: inputs.dispute_id || null,
-      Amount_Issued_to_Customer_Account__c: safeParseFloat(inputs.amount_issued_account),
-      Amount_Issued_to_Guest__c: safeParseFloat(inputs.amount_issued_guest),
-      Refund_Reason_Notes__c: inputs.refund_reason_notes || null,
-      Third_Party_Reimbursement_Status__c: inputs.third_party_reimbursement_status || null,
-      Stripe_Reimbursement_Link__c: inputs.stripe_reimbursement_link || null,
-      Refund_Complete__c: inputs.refund_complete === "Yes"
-    };
-
-    if (sfCaseId) {
-      sfData.Id = sfCaseId;
-      await conn.sobject('Case').update(sfData);
-      console.log(`Successfully updated Refund details for Case ${sfCaseId}`);
-    } else {
-      await conn.sobject('Case').create(sfData);
+    if (!sfCaseId) {
+      throw new Error("Walang linked na Salesforce ticket sa conversation na ito");
     }
 
-    res.json({
-      canvas: {
-        content: {
-          components: buildRefundForm(inputs, "✅ Refund details updated to Salesforce ticket")
-        }
-      }
-    });
+    const meta = await loadCaseFieldMeta();
+    const sfData = { Id: sfCaseId };
+    const skipped = [];
 
+    for (const [key, def] of Object.entries(REFUND_FIELDS)) {
+      const f = meta.resolved[key];
+      if (!f) { skipped.push(key); continue; }
+      if (!f.updateable) { skipped.push(key); continue; }
+
+      if (def.boolean) {
+        if (inputs[key] === "Yes") sfData[f.name] = true;
+        else if (inputs[key] === "No") sfData[f.name] = false;
+        // blank = huwag galawin
+      } else if (def.numeric) {
+        sfData[f.name] = safeParseFloat(inputs[key]);
+      } else {
+        sfData[f.name] = inputs[key] || null; // blank = null
+      }
+    }
+
+    await withSf(conn => conn.sobject('Case').update(sfData));
+    console.log(`Successfully updated Refund details for Case ${sfCaseId}`);
+
+    let msg = "✅ Refund details updated to Salesforce ticket";
+    if (skipped.length > 0) msg += ` (hindi na-save: ${skipped.join(', ')})`;
+
+    res.json({ canvas: { content: { components: buildRefundForm(inputs, msg) } } });
   } catch (error) {
     console.error("Refund Submit Error:", error.message);
-    sfConn = null;
     res.json({
-      canvas: {
-        content: {
-          components: buildRefundForm(inputs, `❌ Save Error: ${error.message}`)
-        }
-      }
+      canvas: { content: { components: buildRefundForm(inputs, `❌ Save Error: ${error.message}`) } }
     });
   }
 });
-
 
 // ==========================================
 // APP 2: SALESFORCE CASE MANAGER APP
@@ -266,27 +343,19 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
   const components = [];
 
   if (message) {
-    components.push({
-      type: "text",
-      text: message,
-      style: "header"
-    });
+    components.push({ type: "text", text: message, style: "header" });
   }
 
   // 1. GO TO SALESFORCE TICKET BUTTON
   if (values.sfCaseId) {
-    const sfDomain = process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com';
-    const caseUrl = `${sfDomain}/${values.sfCaseId}`;
+    const caseUrl = `${sfBaseUrl()}/${values.sfCaseId}`;
     components.push(
       {
         type: "button",
         id: "open_sf_ticket_btn",
         label: "🔗 Go to Salesforce Ticket",
         style: "primary",
-        action: {
-          type: "url",
-          url: caseUrl
-        }
+        action: { type: "url", url: caseUrl }
       },
       { type: "divider" }
     );
@@ -352,7 +421,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     { type: "divider" }
   );
 
-  // 4. SOURCE DROPDOWN FIELD WITH AUTO-SUBMIT ACTION
+  // 4. SOURCE DROPDOWN
   components.push({
     type: "dropdown",
     id: "source",
@@ -374,63 +443,79 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
   return components;
 }
 
+// Contact/Account details -> values (bawat isa hiwalay, hindi nagpapabagsak sa isa't isa)
+function applyContactValues(target, c) {
+  target.contact_search_term = c.Name || "";
+  target.contact_email = c.Email || "N/A";
+  target.contact_phone = c.Phone || "N/A";
+  target.contact_status = c.Contact_Status__c || "N/A";
+}
+
+function applyAccountValues(target, a) {
+  target.account_search_term = a.Name || "";
+  target.account_status = a.Account_Status__c || "N/A";
+  target.partner_level = a.Partner_Level__c || "N/A";
+  target.website = a.Website || "N/A";
+  target.dashboard_url = a.Dashboard_URL__c || "N/A";
+  target.billing_address = formatAddress(a.BillingAddress);
+}
+
 // INITIALIZE CASE MANAGER APP
 app.post('/intercom/account-app/initialize', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
+  console.log('CASE MGR INIT sfCaseId =', sfCaseId, '| conv id =', req.body.conversation?.id);
 
-  let initialValues = { sfCaseId };
+  const initialValues = { sfCaseId };
   let contactList = [];
   let accountList = [];
+  let notice = null;
 
   if (sfCaseId) {
     try {
-      const conn = await getSalesforceConnection();
-      const sfCase = await fetchCaseDetailsSafely(sfCaseId);
+      const sfCase = await fetchCase(sfCaseId);
 
-      if (sfCase && sfCase.Id) {
+      if (sfCase) {
         initialValues.source = sfCase.Source__c || "";
+
+        const [contactRecord, accountRecord] = await Promise.all([
+          sfCase.ContactId
+            ? withSf(c => c.sobject('Contact').retrieve(sfCase.ContactId)).catch(e => { console.error('Contact retrieve error:', e.message); return null; })
+            : null,
+          sfCase.AccountId
+            ? withSf(c => c.sobject('Account').retrieve(sfCase.AccountId)).catch(e => { console.error('Account retrieve error:', e.message); return null; })
+            : null
+        ]);
 
         if (sfCase.ContactId) {
           initialValues.selected_contact_id = sfCase.ContactId;
-          const contactRecord = await conn.sobject('Contact').retrieve(sfCase.ContactId).catch(() => null);
           if (contactRecord) {
-            initialValues.contact_search_term = contactRecord.Name || "";
-            initialValues.contact_email = contactRecord.Email || "N/A";
-            initialValues.contact_phone = contactRecord.Phone || "N/A";
-            initialValues.contact_status = contactRecord.Contact_Status__c || "N/A";
+            applyContactValues(initialValues, contactRecord);
             contactList = [contactRecord];
           }
         }
 
         if (sfCase.AccountId) {
           initialValues.selected_account_id = sfCase.AccountId;
-          const accountRecord = await conn.sobject('Account').retrieve(sfCase.AccountId).catch(() => null);
           if (accountRecord) {
-            initialValues.account_search_term = accountRecord.Name || "";
-            initialValues.account_status = accountRecord.Account_Status__c || "N/A";
-            initialValues.partner_level = accountRecord.Partner_Level__c || "N/A";
-            initialValues.website = accountRecord.Website || "N/A";
-            initialValues.dashboard_url = accountRecord.Dashboard_URL__c || "N/A";
-            initialValues.billing_address = formatAddress(accountRecord.BillingAddress);
+            applyAccountValues(initialValues, accountRecord);
             accountList = [accountRecord];
           }
         }
+      } else {
+        notice = "⚠️ Hindi nahanap ang Salesforce ticket";
       }
-    } catch (err) { 
+    } catch (err) {
       console.error("Case Manager Initialize Error:", err.message);
-      sfConn = null;
+      notice = `⚠️ Hindi ma-load ang data mula sa Salesforce: ${err.message}`;
     }
   }
 
   res.json({
-    canvas: {
-      content: {
-        components: buildAccountContactUI(initialValues, { contactList, accountList })
-      }
-    }
+    canvas: { content: { components: buildAccountContactUI(initialValues, { contactList, accountList }, notice) } }
   });
 });
 
+// SUBMIT CASE MANAGER APP
 app.post('/intercom/account-app/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
   const clickedButton = req.body.component_id;
@@ -439,121 +524,109 @@ app.post('/intercom/account-app/submit', async (req, res) => {
   inputs.sfCaseId = sfCaseId;
 
   try {
-    const conn = await getSalesforceConnection();
-
     let contactList = [];
     let accountList = [];
+    let contactAccountId = null;
 
-    // 1. ACTION: SEARCH CONTACT BUTTON CLICKED
+    // 1. SEARCH CONTACT (display lang, hindi nagse-save)
     if (clickedButton === "search_contact_btn") {
       const searchTerm = (inputs.contact_search_term || "").trim();
       if (searchTerm) {
-        const query = `SELECT Id, Name, Email, Phone, Contact_Status__c, AccountId FROM Contact WHERE Name LIKE '%${searchTerm}%' OR Email LIKE '%${searchTerm}%' OR Phone LIKE '%${searchTerm}%' LIMIT 10`;
-        const result = await conn.query(query).catch(() => ({ records: [] }));
+        const t = esc(searchTerm);
+        const query = `SELECT Id, Name, Email, Phone, Contact_Status__c, AccountId FROM Contact WHERE Name LIKE '%${t}%' OR Email LIKE '%${t}%' OR Phone LIKE '%${t}%' LIMIT 10`;
+        const result = await withSf(conn => conn.query(query));
         contactList = result.records || [];
-        if (contactList.length > 0) {
-          inputs.selected_contact_id = contactList[0].Id;
-        }
+        if (contactList.length > 0) inputs.selected_contact_id = contactList[0].Id;
       }
     }
 
-    // 2. ACTION: SEARCH ACCOUNT BUTTON CLICKED
+    // 2. SEARCH ACCOUNT (display lang, hindi nagse-save)
     if (clickedButton === "search_account_btn") {
       const searchTerm = (inputs.account_search_term || "").trim();
       if (searchTerm) {
-        const query = `SELECT Id, Name, Account_Status__c, Partner_Level__c, Website, Dashboard_URL__c, BillingAddress FROM Account WHERE Name LIKE '%${searchTerm}%' LIMIT 10`;
-        const result = await conn.query(query).catch(() => ({ records: [] }));
+        const t = esc(searchTerm);
+        const query = `SELECT Id, Name, Account_Status__c, Partner_Level__c, Website, Dashboard_URL__c, BillingAddress FROM Account WHERE Name LIKE '%${t}%' LIMIT 10`;
+        const result = await withSf(conn => conn.query(query));
         accountList = result.records || [];
-        if (accountList.length > 0) {
-          inputs.selected_account_id = accountList[0].Id;
-        }
+        if (accountList.length > 0) inputs.selected_account_id = accountList[0].Id;
       }
     }
 
-    // 3. INDEPENDENT CONTACT RETRIEVAL
-    if (inputs.selected_contact_id) {
+    // 3. CONTACT RETRIEVAL
+    if (isSfId(inputs.selected_contact_id)) {
       try {
-        const targetContact = await conn.sobject('Contact').retrieve(inputs.selected_contact_id);
+        const targetContact = await withSf(conn => conn.sobject('Contact').retrieve(inputs.selected_contact_id));
         if (targetContact) {
           if (contactList.length === 0) contactList = [targetContact];
-          inputs.contact_email = targetContact.Email || "N/A";
-          inputs.contact_phone = targetContact.Phone || "N/A";
-          inputs.contact_status = targetContact.Contact_Status__c || "N/A";
+          applyContactValues(inputs, targetContact);
+          contactAccountId = targetContact.AccountId || null;
 
-          if (clickedButton === "search_contact_btn" && targetContact.AccountId) {
-            inputs.selected_account_id = targetContact.AccountId;
+          // Auto-set ang account ng contact (pwede pa ring palitan ng agent)
+          if ((clickedButton === "search_contact_btn" || clickedButton === "selected_contact_id") && contactAccountId) {
+            inputs.selected_account_id = contactAccountId;
           }
         }
       } catch (cErr) { console.error("Contact Retrieve Error:", cErr.message); }
     }
 
-    // 4. INDEPENDENT ACCOUNT RETRIEVAL
-    if (inputs.selected_account_id) {
+    // 4. ACCOUNT RETRIEVAL
+    if (isSfId(inputs.selected_account_id)) {
       try {
-        const targetAcc = await conn.sobject('Account').retrieve(inputs.selected_account_id);
+        const targetAcc = await withSf(conn => conn.sobject('Account').retrieve(inputs.selected_account_id));
         if (targetAcc) {
           if (accountList.length === 0) accountList = [targetAcc];
-          inputs.account_search_term = targetAcc.Name;
-          inputs.account_status = targetAcc.Account_Status__c || "N/A";
-          inputs.partner_level = targetAcc.Partner_Level__c || "N/A";
-          inputs.website = targetAcc.Website || "N/A";
-          inputs.dashboard_url = targetAcc.Dashboard_URL__c || "N/A";
-          inputs.billing_address = formatAddress(targetAcc.BillingAddress);
+          applyAccountValues(inputs, targetAcc);
         }
       } catch (aErr) { console.error("Account Retrieve Error:", aErr.message); }
     }
 
-    // STRICT DETERMINATION OF UPDATE NOTICE BANNER
+    // BANNER
     let updateNotice = "✅ Salesforce ticket updated";
+    if (clickedButton === "source") updateNotice = "✅ Source set to Salesforce ticket";
+    else if (clickedButton === "selected_contact_id") updateNotice = "✅ Contact updated to Salesforce ticket";
+    else if (clickedButton === "selected_account_id") updateNotice = "✅ Account updated to Salesforce ticket";
+    else if (clickedButton === "search_contact_btn") updateNotice = "🔍 Select matching contact below";
+    else if (clickedButton === "search_account_btn") updateNotice = "🔍 Select matching account below";
 
-    if (clickedButton === "source") {
-      updateNotice = "✅ Source set to Salesforce ticket";
-    } else if (clickedButton === "selected_contact_id") {
-      updateNotice = "✅ Contact updated to Salesforce ticket";
-    } else if (clickedButton === "selected_account_id") {
-      updateNotice = "✅ Account updated to Salesforce ticket";
-    } else if (clickedButton === "search_contact_btn") {
-      updateNotice = "🔍 Select matching contact below";
-    } else if (clickedButton === "search_account_btn") {
-      updateNotice = "🔍 Select matching account below";
-    }
-
-    // UPDATE Source__c DIRECTLY TO SALESFORCE CASE
+    // SAVE: ang piniling field lang ang isusulat (walang nabubura)
     if (sfCaseId) {
-      const sfData = {
-        Id: sfCaseId,
-        ContactId: inputs.selected_contact_id || null,
-        AccountId: inputs.selected_account_id || null
-      };
+      const sfData = {};
 
-      if (inputs.source !== undefined) {
-        sfData.Source__c = inputs.source;
+      if (clickedButton === "selected_contact_id" && isSfId(inputs.selected_contact_id)) {
+        sfData.ContactId = inputs.selected_contact_id;
+        if (contactAccountId) sfData.AccountId = contactAccountId;
+      } else if (clickedButton === "selected_account_id" && isSfId(inputs.selected_account_id)) {
+        sfData.AccountId = inputs.selected_account_id;
+      } else if (clickedButton === "source") {
+        sfData.Source__c = inputs.source || null;
       }
 
-      await conn.sobject('Case').update(sfData);
-      console.log(`Auto-synced Case ${sfCaseId} with Source: ${inputs.source}`);
+      if (Object.keys(sfData).length > 0) {
+        sfData.Id = sfCaseId;
+        await withSf(conn => conn.sobject('Case').update(sfData));
+        console.log(`Synced Case ${sfCaseId}:`, JSON.stringify(sfData));
+      }
+    } else if (!String(clickedButton).startsWith('search_')) {
+      updateNotice = "⚠️ Walang linked na Salesforce ticket";
     }
 
     res.json({
-      canvas: {
-        content: {
-          components: buildAccountContactUI(inputs, { contactList, accountList }, updateNotice)
-        }
-      }
+      canvas: { content: { components: buildAccountContactUI(inputs, { contactList, accountList }, updateNotice) } }
     });
-
   } catch (err) {
     console.error("Auto-save Error:", err.message);
-    sfConn = null;
     res.json({
-      canvas: {
-        content: {
-          components: buildAccountContactUI(inputs, {}, `❌ Sync Error: ${err.message}`)
-        }
-      }
+      canvas: { content: { components: buildAccountContactUI(inputs, {}, `❌ Sync Error: ${err.message}`) } }
     });
   }
 });
 
+// Health check (para sa Render)
+app.get('/', (req, res) => res.send('OK'));
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
+  // Warm-up: mag-login at mag-describe na agad para mabilis ang unang request
+  loadCaseFieldMeta().catch(e => console.error('Warm-up error:', e.message));
+});
