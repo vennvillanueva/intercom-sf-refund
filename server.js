@@ -120,8 +120,14 @@ const REFUND_FIELDS = {
 
 let caseMeta = null;
 let caseMetaPromise = null;
+let caseMetaAt = 0;
+const CASE_META_TTL_MS = 60 * 60 * 1000; // refresh describe (picklists etc.) every hour
 
 async function loadCaseFieldMeta() {
+  if (caseMeta && Date.now() - caseMetaAt > CASE_META_TTL_MS) {
+    caseMeta = null;
+    caseMetaPromise = null;
+  }
   if (caseMeta) return caseMeta;
   if (!caseMetaPromise) {
     caseMetaPromise = withSf(conn => conn.sobject('Case').describe())
@@ -145,6 +151,7 @@ async function loadCaseFieldMeta() {
         console.log('Case fields matching "reimburs/stripe":', hints.join(', ') || '(none)');
 
         caseMeta = { byLower, resolved };
+        caseMetaAt = Date.now();
         return caseMeta;
       })
       .catch(err => { caseMetaPromise = null; throw err; });
@@ -677,6 +684,306 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       canvas: { content: { components: buildAccountContactUI(inputs, {}, `❌ Sync Error: ${err.message}`) } }
     });
   }
+});
+
+// ==========================================
+// APP 3: CASE REASON APP
+// Primary / Secondary / Tertiary reason (dependent picklists) + Case Summary
+// ==========================================
+const REASON_SF = {
+  primary: 'Case_Reason__c',
+  secondary: 'Case_Secondary_Reason__c',
+  tertiary: 'Case_Tertiary_Reason__c',
+  notes: 'Case_Closed_Notes__c'
+};
+
+// Intercom conversation attribute names (override with env vars if they differ)
+const REASON_IC = {
+  primary: process.env.IC_ATTR_PRIMARY || 'Primary Topic',
+  secondary: process.env.IC_ATTR_SECONDARY || 'Secondary Topic',
+  tertiary: process.env.IC_ATTR_TERTIARY || 'Tertiary Topic',
+  summary: process.env.IC_ATTR_SUMMARY || 'Case summary',
+  stage: process.env.IC_ATTR_STAGE || null // optional exact name of the Conversation Stage attribute
+};
+
+// ---- Intercom API helpers ----
+async function intercomRequest(method, path, body) {
+  if (!process.env.INTERCOM_TOKEN) throw new Error('INTERCOM_TOKEN is not set');
+  const r = await fetch(`https://api.intercom.io${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${process.env.INTERCOM_TOKEN}`,
+      'Intercom-Version': '2.11',
+      Accept: 'application/json',
+      'Content-Type': 'application/json'
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const text = await r.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) { /* not JSON */ }
+  if (!r.ok) {
+    const apiMsg = json && json.errors && json.errors[0] && json.errors[0].message;
+    throw new Error(`Intercom API ${r.status}: ${apiMsg || text.slice(0, 200)}`);
+  }
+  return json;
+}
+
+// Conversation attributes: from the Intercom API when possible, otherwise from the app payload
+async function loadIntercomAttrs(body) {
+  const payloadAttrs = (body.conversation && body.conversation.custom_attributes) || {};
+  const convId = body.conversation && body.conversation.id;
+  if (!convId || !process.env.INTERCOM_TOKEN) return payloadAttrs;
+  try {
+    const conv = await intercomRequest('GET', `/conversations/${convId}`);
+    return conv.custom_attributes || payloadAttrs;
+  } catch (e) {
+    console.error('Intercom conversation fetch error:', e.message);
+    return payloadAttrs;
+  }
+}
+
+function findStage(attrs) {
+  if (!attrs) return null;
+  if (REASON_IC.stage && attrs[REASON_IC.stage] != null && attrs[REASON_IC.stage] !== '') return String(attrs[REASON_IC.stage]);
+  const key = Object.keys(attrs).find(k => /stage/i.test(k));
+  return key && attrs[key] != null && attrs[key] !== '' ? String(attrs[key]) : null;
+}
+
+// ---- Salesforce dependent picklist helpers ----
+function isValidFor(buf, idx) {
+  return (buf[idx >> 3] & (0x80 >> (idx % 8))) !== 0;
+}
+
+// Options of a picklist field, filtered by the controlling field's selected value
+function picklistOptions(meta, fieldName, controllerValue) {
+  const f = meta.byLower.get(fieldName.toLowerCase());
+  if (!f) return [];
+  const active = (f.picklistValues || []).filter(v => v.active);
+  if (!f.controllerName) return active.map(v => v.value);
+
+  const ctrl = meta.byLower.get(f.controllerName.toLowerCase());
+  if (!ctrl) return active.map(v => v.value);
+  const idx = (ctrl.picklistValues || []).findIndex(v => v.value === controllerValue);
+  if (idx < 0) return [];
+  return active
+    .filter(v => v.validFor && isValidFor(Buffer.from(v.validFor, 'base64'), idx))
+    .map(v => v.value);
+}
+
+async function fetchReasonCase(sfCaseId) {
+  const meta = await loadCaseFieldMeta();
+  const fields = ['Id'];
+  Object.values(REASON_SF).forEach(n => {
+    const f = meta.byLower.get(n.toLowerCase());
+    if (f) fields.push(f.name);
+    else console.warn(`⚠️ Salesforce field ${n} not found on Case`);
+  });
+  const soql = `SELECT ${fields.join(', ')} FROM Case WHERE Id = '${esc(sfCaseId)}' LIMIT 1`;
+  const result = await withSf(conn => conn.query(soql));
+  return (result.records && result.records[0]) || null;
+}
+
+function reasonDropdown(id, label, options, value) {
+  const opts = options.slice();
+  if (value && !opts.includes(value)) opts.unshift(value); // never hide the value currently on the Case
+  return {
+    type: "dropdown",
+    id,
+    label,
+    options: [{ type: "option", id: "", text: "-- Select --" }, ...opts.map(o => ({ type: "option", id: o, text: o }))],
+    value: value || "",
+    action: { type: "submit" }
+  };
+}
+
+function buildReasonUI(values, stage, meta, message) {
+  const components = [
+    { type: "text", text: `*Conversation Stage:* ${stage || 'N/A'}`, style: "header" }
+  ];
+  if (message) components.push({ type: "text", text: message, style: "paragraph" });
+  components.push({ type: "divider" });
+
+  const primaryOpts = picklistOptions(meta, REASON_SF.primary, null);
+  const secondaryOpts = values.primary ? picklistOptions(meta, REASON_SF.secondary, values.primary) : [];
+  const tertiaryOpts = values.secondary ? picklistOptions(meta, REASON_SF.tertiary, values.secondary) : [];
+
+  components.push(
+    reasonDropdown("primary", "Primary Topic", primaryOpts, values.primary),
+    reasonDropdown("secondary", "Secondary Topic", secondaryOpts, values.secondary),
+    reasonDropdown("tertiary", "Tertiary Topic", tertiaryOpts, values.tertiary),
+    { type: "divider" },
+    { type: "textarea", id: "case_summary", label: "Case Summary", value: values.case_summary || "" },
+    { type: "button", id: "save_notes_btn", label: "💾 Save Case Summary", style: "primary", action: { type: "submit" } }
+  );
+  return components;
+}
+
+// INITIALIZE CASE REASON APP
+app.post('/intercom/case-reason-app/initialize', async (req, res) => {
+  const sfCaseId = extractSfCaseId(req.body);
+  console.log('CASE REASON INIT sfCaseId =', sfCaseId, '| conv id =', req.body.conversation && req.body.conversation.id);
+
+  const values = {};
+  let notice = null;
+  let stage = null;
+  let meta = null;
+
+  try {
+    meta = await loadCaseFieldMeta();
+
+    const [rec, attrs] = await Promise.all([
+      sfCaseId ? fetchReasonCase(sfCaseId) : null,
+      loadIntercomAttrs(req.body)
+    ]);
+
+    stage = findStage(attrs);
+    console.log('INTERCOM ATTR KEYS:', Object.keys(attrs || {}).join(', '), '| stage =', stage);
+
+    if (rec) {
+      values.primary = rec[REASON_SF.primary] || "";
+      values.secondary = rec[REASON_SF.secondary] || "";
+      values.tertiary = rec[REASON_SF.tertiary] || "";
+      values.case_summary = rec[REASON_SF.notes] || "";
+    } else if (sfCaseId) {
+      notice = "⚠️ Salesforce ticket not found";
+    } else {
+      notice = "⚠️ No Salesforce ticket linked to this conversation";
+    }
+
+    // Salesforce has no notes yet but Intercom has a summary: prefill (agent clicks Save to sync)
+    if (rec && !values.case_summary && attrs && attrs[REASON_IC.summary]) {
+      values.case_summary = String(attrs[REASON_IC.summary]);
+      notice = "ℹ️ Case Summary prefilled from Intercom. Click Save to sync it to Salesforce";
+    }
+  } catch (err) {
+    console.error("Case Reason Initialize Error:", err.message);
+    notice = `⚠️ Could not load data from Salesforce: ${err.message}`;
+  }
+
+  if (!meta) {
+    return res.json({ canvas: { content: { components: [{ type: "text", text: notice || "⚠️ Could not load", style: "header" }] } } });
+  }
+  res.json({ canvas: { content: { components: buildReasonUI(values, stage, meta, notice) } } });
+});
+
+// SUBMIT CASE REASON APP
+// Same approach as the Case Manager: never rely on component_id for dropdowns.
+// Compare the submitted values with the Case in Salesforce and save what changed.
+app.post('/intercom/case-reason-app/submit', async (req, res) => {
+  const inputs = req.body.input_values || {};
+  const clickedButton = req.body.component_id;
+  const sfCaseId = extractSfCaseId(req.body);
+  const convId = req.body.conversation && req.body.conversation.id;
+
+  console.log('CASE REASON SUBMIT', JSON.stringify({
+    component_id: clickedButton,
+    sfCaseId,
+    primary: inputs.primary,
+    secondary: inputs.secondary,
+    tertiary: inputs.tertiary
+  }));
+
+  let meta = null;
+  const values = {
+    primary: inputs.primary || "",
+    secondary: inputs.secondary || "",
+    tertiary: inputs.tertiary || "",
+    case_summary: inputs.case_summary || ""
+  };
+  let stage = null;
+  let notice;
+
+  try {
+    meta = await loadCaseFieldMeta();
+    if (!sfCaseId) throw new Error("No Salesforce ticket is linked to this conversation");
+
+    const base = await fetchReasonCase(sfCaseId);
+    if (!base) throw new Error("Salesforce ticket not found");
+
+    const cur = {
+      primary: base[REASON_SF.primary] || "",
+      secondary: base[REASON_SF.secondary] || "",
+      tertiary: base[REASON_SF.tertiary] || ""
+    };
+    const next = { primary: values.primary, secondary: values.secondary, tertiary: values.tertiary };
+    let wasReset = false;
+
+    // Reset dependent levels when a higher level changes (payload values below it are stale)
+    if (next.primary !== cur.primary) {
+      if (next.secondary || next.tertiary) wasReset = true;
+      next.secondary = "";
+      next.tertiary = "";
+    } else if (next.secondary !== cur.secondary) {
+      if (next.tertiary) wasReset = true;
+      next.tertiary = "";
+    }
+
+    // Drop values that are not valid for the selected parent
+    if (next.secondary && !picklistOptions(meta, REASON_SF.secondary, next.primary).includes(next.secondary)) next.secondary = "";
+    if (next.tertiary && !picklistOptions(meta, REASON_SF.tertiary, next.secondary).includes(next.tertiary)) next.tertiary = "";
+
+    const sfChanges = {};
+    const icChanges = {};
+    ['primary', 'secondary', 'tertiary'].forEach(k => {
+      if (next[k] !== cur[k]) {
+        sfChanges[REASON_SF[k]] = next[k] || null;
+        icChanges[REASON_IC[k]] = next[k] || null;
+      }
+    });
+
+    let notesSaved = false;
+    if (clickedButton === "save_notes_btn") {
+      sfChanges[REASON_SF.notes] = inputs.case_summary || null;
+      icChanges[REASON_IC.summary] = inputs.case_summary || null;
+      notesSaved = true;
+    }
+
+    // Only write fields that exist and are updateable
+    Object.keys(sfChanges).forEach(name => {
+      const f = meta.byLower.get(name.toLowerCase());
+      if (!f || !f.updateable) {
+        console.warn(`⚠️ Skipping ${name}: missing or not updateable`);
+        delete sfChanges[name];
+      }
+    });
+
+    Object.assign(values, next);
+
+    if (Object.keys(sfChanges).length === 0) {
+      notice = "ℹ️ No changes to save";
+    } else {
+      await withSf(conn => conn.sobject('Case').update({ Id: sfCaseId, ...sfChanges }));
+      console.log(`Synced Case ${sfCaseId}:`, Object.keys(sfChanges).join(', '));
+
+      let icNote = "";
+      if (convId && Object.keys(icChanges).length > 0) {
+        try {
+          await intercomRequest('PUT', `/conversations/${convId}`, { custom_attributes: icChanges });
+        } catch (icErr) {
+          console.error('Intercom update error:', icErr.message);
+          icNote = ` ⚠️ Intercom update failed: ${icErr.message}`;
+        }
+      }
+
+      notice = notesSaved && Object.keys(sfChanges).length === 1
+        ? "✅ Case Summary saved to Salesforce and Intercom"
+        : "✅ Topics saved to Salesforce and Intercom";
+      if (wasReset) notice += " (lower levels were reset)";
+      if (icNote) notice = notice.replace(" and Intercom", "") + icNote;
+    }
+
+    const attrs = await loadIntercomAttrs(req.body);
+    stage = findStage(attrs);
+  } catch (err) {
+    console.error("Case Reason Submit Error:", err.message);
+    notice = `❌ Save Error: ${err.message}`;
+  }
+
+  if (!meta) {
+    return res.json({ canvas: { content: { components: [{ type: "text", text: notice, style: "header" }] } } });
+  }
+  res.json({ canvas: { content: { components: buildReasonUI(values, stage, meta, notice) } } });
 });
 
 // Health check (for Render)
