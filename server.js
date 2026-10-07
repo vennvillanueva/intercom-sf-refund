@@ -33,7 +33,7 @@ async function getSalesforceConnection() {
 }
 
 // Helper function to build Canvas Kit UI
-function buildRefundForm(values = {}, successMessage = null) {
+function buildRefundForm(values = {}, options = {}, successMessage = null) {
   const components = [];
 
   if (successMessage) {
@@ -50,11 +50,46 @@ function buildRefundForm(values = {}, successMessage = null) {
     });
   }
 
+  // 1. Account Details (Auto-fetched from Intercom salesforce_account_id but Editable)
   components.push(
-    // 1. Order ID (Pinaka-unang field)
+    { type: "input", id: "account_name", label: "Account Name", value: values.account_name || "" },
+    { type: "input", id: "account_status", label: "Account Status", value: values.account_status || "" }
+  );
+
+  // 2. Contact Search & Lookup Selection
+  components.push(
+    { type: "input", id: "contact_search_term", label: "Search Contact Name", value: values.contact_search_term || "", placeholder: "Type name to search SF contacts..." },
+    { type: "button", id: "search_contact_btn", label: "🔍 Search Contact", style: "secondary", action: { type: "submit" } }
+  );
+
+  // Kapag may nahanap na contacts mula sa search, lalabas itong dropdown selector
+  if (options.contactList && options.contactList.length > 0) {
+    const dropdownOptions = options.contactList.map(c => ({
+      type: "option",
+      id: c.Id,
+      text: `${c.Name} (${c.Email || 'No Email'})`
+    }));
+
+    components.push({
+      type: "dropdown",
+      id: "selected_contact_id",
+      label: "Select Matching Contact",
+      options: dropdownOptions,
+      value: values.selected_contact_id || dropdownOptions[0].id
+    });
+  } else if (values.selected_contact_name) {
+    components.push({
+      type: "text",
+      text: `Selected Contact: ${values.selected_contact_name}`,
+      style: "paragraph"
+    });
+  }
+
+  components.push({ type: "divider" });
+
+  // 3. Order & Refund Details
+  components.push(
     { type: "input", id: "order_id", label: "Order ID", value: values.order_id || "" },
-    
-    // 2. Date of Order
     { type: "input", id: "date_of_order", label: "Date of Order", value: values.date_of_order || "", placeholder: "YYYY-MM-DD" },
     { type: "input", id: "guest_name", label: "Guest Name", value: values.guest_name || "" },
     
@@ -129,21 +164,40 @@ function buildRefundForm(values = {}, successMessage = null) {
   return components;
 }
 
-// 1. INITIALIZE FLOW (Pre-populate with existing Salesforce Data on Hard Refresh)
+// 1. INITIALIZE FLOW (Pre-populate Account Name, Account Status, and Case Data)
 app.post('/intercom/initialize', async (req, res) => {
   const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
                 || req.body.custom_attributes?.salesforce_id
                 || req.body.customer?.custom_attributes?.salesforce_id;
 
+  const sfAccountId = req.body.conversation?.custom_attributes?.salesforce_account_id 
+                   || req.body.custom_attributes?.salesforce_account_id
+                   || req.body.customer?.custom_attributes?.salesforce_account_id;
+
   let existingValues = {};
 
-  if (sfCaseId) {
-    try {
-      const conn = await getSalesforceConnection();
-      const sfRecord = await conn.sobject('Case').retrieve(sfCaseId);
+  try {
+    const conn = await getSalesforceConnection();
 
+    // Fetch Account Name & Account_Status__c via salesforce_account_id
+    if (sfAccountId) {
+      try {
+        const sfAccount = await conn.sobject('Account').retrieve(sfAccountId);
+        if (sfAccount) {
+          existingValues.account_name = sfAccount.Name || "";
+          existingValues.account_status = sfAccount.Account_Status__c || "";
+        }
+      } catch (accErr) {
+        console.error("Account Fetch Error:", accErr.message);
+      }
+    }
+
+    // Fetch existing Case details
+    if (sfCaseId) {
+      const sfRecord = await conn.sobject('Case').retrieve(sfCaseId);
       if (sfRecord) {
         existingValues = {
+          ...existingValues,
           order_id: sfRecord.Order_ID__c || "",
           date_of_order: sfRecord.Date_of_Order__c || "",
           guest_name: sfRecord.Guest_Name__c || "",
@@ -154,12 +208,18 @@ app.post('/intercom/initialize', async (req, res) => {
           amount_issued_account: sfRecord.Amount_Issued_to_Customer_Account__c ? String(sfRecord.Amount_Issued_to_Customer_Account__c) : "",
           amount_issued_guest: sfRecord.Amount_Issued_to_Guest__c ? String(sfRecord.Amount_Issued_to_Guest__c) : "",
           refund_reason_notes: sfRecord.Refund_Reason_Notes__c || "",
-          refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
+          refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No",
+          selected_contact_id: sfRecord.ContactId || ""
         };
+
+        if (sfRecord.ContactId) {
+          const contactRec = await conn.sobject('Contact').retrieve(sfRecord.ContactId);
+          existingValues.selected_contact_name = contactRec ? contactRec.Name : "";
+        }
       }
-    } catch (err) {
-      console.error("Error fetching existing record on initialize:", err.message);
     }
+  } catch (err) {
+    console.error("Error on initialize:", err.message);
   }
 
   res.json({
@@ -171,19 +231,39 @@ app.post('/intercom/initialize', async (req, res) => {
   });
 });
 
-// 2. SUBMIT FLOW
+// 2. SUBMIT FLOW (Handles Contact Search or Ticket Update)
 app.post('/intercom/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
+  const clickedButton = req.body.component_id; // Hanapin kung aling button ang pinindot
   
   const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
                 || req.body.custom_attributes?.salesforce_id
                 || req.body.customer?.custom_attributes?.salesforce_id;
 
-  console.log("Detected Salesforce Case ID:", sfCaseId);
-
   try {
     const conn = await getSalesforceConnection();
 
+    // CASE A: PININDOT ANG "SEARCH CONTACT" BUTTON
+    if (clickedButton === "search_contact_btn" || (inputs.contact_search_term && !clickedButton)) {
+      const searchTerm = inputs.contact_search_term.trim();
+      let contactList = [];
+
+      if (searchTerm) {
+        const query = `SELECT Id, Name, Email FROM Contact WHERE Name LIKE '%${searchTerm}%' LIMIT 10`;
+        const result = await conn.query(query);
+        contactList = result.records || [];
+      }
+
+      return res.json({
+        canvas: {
+          content: {
+            components: buildRefundForm(inputs, { contactList }, contactList.length > 0 ? `Found ${contactList.length} matching contacts:` : "No contacts found.")
+          }
+        }
+      });
+    }
+
+    // CASE B: UPDATE / CREATE SALESFORCE TICKET
     const sfData = {
       Order_ID__c: inputs.order_id || null,
       Date_of_Order__c: inputs.date_of_order || null,
@@ -198,6 +278,11 @@ app.post('/intercom/submit', async (req, res) => {
       Refund_Complete__c: inputs.refund_complete === "Yes"
     };
 
+    // Attach ContactId kung may napili sa dropdown selector
+    if (inputs.selected_contact_id) {
+      sfData.ContactId = inputs.selected_contact_id;
+    }
+
     if (sfCaseId) {
       sfData.Id = sfCaseId;
       await conn.sobject('Case').update(sfData);
@@ -210,7 +295,7 @@ app.post('/intercom/submit', async (req, res) => {
     res.json({
       canvas: {
         content: {
-          components: buildRefundForm(inputs, "✅ Successfully Synced to Salesforce QA!")
+          components: buildRefundForm(inputs, {}, "✅ Successfully Synced to Salesforce QA!")
         }
       }
     });
@@ -222,7 +307,7 @@ app.post('/intercom/submit', async (req, res) => {
     res.json({
       canvas: {
         content: {
-          components: buildRefundForm(inputs, `❌ Sync Error: ${error.message}`)
+          components: buildRefundForm(inputs, {}, `❌ Sync Error: ${error.message}`)
         }
       }
     });
