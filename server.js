@@ -173,14 +173,14 @@ app.post('/intercom/submit', async (req, res) => {
 
 
 // ==========================================
-// APP 2: SALESFORCE CASE MANAGER (No Header inside Canvas)
+// APP 2: SALESFORCE CASE MANAGER
 // ==========================================
 function buildAccountContactUI(values = {}, options = {}) {
   const components = [];
 
-  // Contact Search Block (Directly starts here)
+  // 1. CONTACT SEARCH BLOCK (Supports Name, Email, or Phone Search)
   components.push(
-    { type: "input", id: "contact_search_term", label: "Search Contact", value: values.contact_search_term || "", placeholder: "Type contact name..." },
+    { type: "input", id: "contact_search_term", label: "Search Contact", value: values.contact_search_term || "", placeholder: "Name, email, or phone..." },
     { type: "button", id: "search_contact_btn", label: "🔍 Search Contact", style: "primary", action: { type: "submit" } }
   );
 
@@ -188,7 +188,7 @@ function buildAccountContactUI(values = {}, options = {}) {
     const contactDropdown = options.contactList.map(c => ({
       type: "option",
       id: c.Id,
-      text: `${c.Name} (${c.Email || 'No Email'})`
+      text: `${c.Name} (${c.Email || c.Phone || 'No Email/Phone'})`
     }));
     components.push({
       type: "dropdown",
@@ -202,7 +202,7 @@ function buildAccountContactUI(values = {}, options = {}) {
   components.push({ type: "text", text: `*Contact Status:* ${values.contact_status || 'N/A'}`, style: "paragraph" });
   components.push({ type: "divider" });
 
-  // Account Search Block
+  // 2. ACCOUNT SEARCH BLOCK
   components.push(
     { type: "input", id: "account_search_term", label: "Search Account", value: values.account_search_term || "", placeholder: "Type account name..." },
     { type: "button", id: "search_account_btn", label: "🔍 Search Account", style: "primary", action: { type: "submit" } }
@@ -232,44 +232,109 @@ function buildAccountContactUI(values = {}, options = {}) {
     { type: "text", text: `*Billing Address:* ${values.billing_address || 'N/A'}`, style: "paragraph" }
   );
 
+  components.push({ type: "divider" });
+
+  // 3. SOURCE DROPDOWN FIELD (Mapped to Source__c)
+  components.push({
+    type: "dropdown",
+    id: "source",
+    label: "Source",
+    options: [
+      { type: "option", id: "", text: "-- Select Source --" },
+      { type: "option", id: "Customer - Live", text: "Customer - Live" },
+      { type: "option", id: "Customer - Churned", text: "Customer - Churned" },
+      { type: "option", id: "Customer - Onboarding", text: "Customer - Onboarding" },
+      { type: "option", id: "Inbound Lead", text: "Inbound Lead" },
+      { type: "option", id: "Guest", text: "Guest" },
+      { type: "option", id: "Google", text: "Google" },
+      { type: "option", id: "Other", text: "Other" }
+    ],
+    value: values.source || ""
+  });
+
+  // 4. SUBMIT BUTTON
+  components.push({
+    type: "button",
+    id: "submit_case_manager",
+    label: "Update Salesforce Ticket",
+    style: "primary",
+    action: { type: "submit" }
+  });
+
   return components;
 }
 
 app.post('/intercom/account-app/initialize', async (req, res) => {
+  const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
+                || req.body.custom_attributes?.salesforce_id
+                || req.body.customer?.custom_attributes?.salesforce_id;
+
   const sfAccountId = req.body.conversation?.custom_attributes?.salesforce_account_id 
                    || req.body.custom_attributes?.salesforce_account_id
                    || req.body.customer?.custom_attributes?.salesforce_account_id;
+
   let initialValues = {};
-  if (sfAccountId) {
-    try {
-      const conn = await getSalesforceConnection();
-      const sfAccount = await conn.sobject('Account').retrieve(sfAccountId);
-      if (sfAccount) {
-        initialValues = {
-          account_search_term: sfAccount.Name || "",
-          account_status: sfAccount.Account_Status__c || "N/A",
-          partner_level: sfAccount.Partner_Level__c || "N/A",
-          website: sfAccount.Website || "N/A",
-          dashboard_url: sfAccount.Dashboard_URL__c || "N/A",
-          billing_address: formatAddress(sfAccount.BillingAddress)
-        };
+
+  try {
+    const conn = await getSalesforceConnection();
+
+    // Fetch existing Case Source__c & ContactId
+    if (sfCaseId) {
+      try {
+        const sfCase = await conn.sobject('Case').retrieve(sfCaseId);
+        if (sfCase) {
+          initialValues.source = sfCase.Source__c || "";
+          initialValues.selected_contact_id = sfCase.ContactId || "";
+        }
+      } catch (caseErr) { console.error("Case Fetch Error:", caseErr.message); }
+    }
+
+    // Fetch Account Details
+    if (sfAccountId) {
+      try {
+        const sfAccount = await conn.sobject('Account').retrieve(sfAccountId);
+        if (sfAccount) {
+          initialValues = {
+            ...initialValues,
+            account_search_term: sfAccount.Name || "",
+            account_status: sfAccount.Account_Status__c || "N/A",
+            partner_level: sfAccount.Partner_Level__c || "N/A",
+            website: sfAccount.Website || "N/A",
+            dashboard_url: sfAccount.Dashboard_URL__c || "N/A",
+            billing_address: formatAddress(sfAccount.BillingAddress),
+            selected_account_id: sfAccountId
+          };
+        }
+      } catch (accErr) { console.error("Account Fetch Error:", accErr.message); }
+    }
+  } catch (err) { console.error("Initialize Error:", err.message); }
+
+  res.json({
+    canvas: {
+      content: {
+        components: buildAccountContactUI(initialValues)
       }
-    } catch (err) { console.error(err.message); }
-  }
-  res.json({ canvas: { content: { components: buildAccountContactUI(initialValues) } } });
+    }
+  });
 });
 
 app.post('/intercom/account-app/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
   const clickedButton = req.body.component_id;
+
+  const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
+                || req.body.custom_attributes?.salesforce_id
+                || req.body.customer?.custom_attributes?.salesforce_id;
+
   try {
     const conn = await getSalesforceConnection();
 
+    // 1. SEARCH CONTACT (Search Name OR Email OR Phone)
     if (clickedButton === "search_contact_btn") {
       const searchTerm = (inputs.contact_search_term || "").trim();
       let contactList = [];
       if (searchTerm) {
-        const query = `SELECT Id, Name, Contact_Status__c FROM Contact WHERE Name LIKE '%${searchTerm}%' LIMIT 10`;
+        const query = `SELECT Id, Name, Email, Phone, Contact_Status__c FROM Contact WHERE Name LIKE '%${searchTerm}%' OR Email LIKE '%${searchTerm}%' OR Phone LIKE '%${searchTerm}%' LIMIT 10`;
         const result = await conn.query(query);
         contactList = result.records || [];
         if (contactList.length > 0) {
@@ -279,6 +344,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       return res.json({ canvas: { content: { components: buildAccountContactUI(inputs, { contactList }) } } });
     }
 
+    // 2. SEARCH ACCOUNT
     if (clickedButton === "search_account_btn") {
       const searchTerm = (inputs.account_search_term || "").trim();
       let accountList = [];
@@ -298,8 +364,33 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       return res.json({ canvas: { content: { components: buildAccountContactUI(inputs, { accountList }) } } });
     }
 
+    // 3. UPDATE SALESFORCE CASE TICKET (Updates ContactId, AccountId, & Source__c)
+    const sfData = {
+      Source__c: inputs.source || null
+    };
+
+    if (inputs.selected_contact_id) {
+      sfData.ContactId = inputs.selected_contact_id;
+    }
+
+    if (inputs.selected_account_id) {
+      sfData.AccountId = inputs.selected_account_id;
+    }
+
+    if (sfCaseId) {
+      sfData.Id = sfCaseId;
+      await conn.sobject('Case').update(sfData);
+      console.log(`Successfully Updated Case ${sfCaseId} from Case Manager App`);
+    } else {
+      const result = await conn.sobject('Case').create(sfData);
+      console.log(`Created New Case ${result.id} from Case Manager App`);
+    }
+
     res.json({ canvas: { content: { components: buildAccountContactUI(inputs) } } });
+
   } catch (err) {
+    console.error("Case Manager Submit Error:", err.message);
+    sfConn = null;
     res.json({ canvas: { content: { components: buildAccountContactUI(inputs) } } });
   }
 });
