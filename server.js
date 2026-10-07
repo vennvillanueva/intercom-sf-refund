@@ -5,17 +5,11 @@ const jsforce = require('jsforce');
 const app = express();
 app.use(express.json());
 
-app.use((req, res, next) => {
-  res.setHeader('ngrok-skip-browser-warning', 'true');
-  res.setHeader('Bypass-Tunnel-Reminder', 'true');
-  next();
-});
-
 // ==========================================
 // SALESFORCE CONNECTION (race-condition safe)
 // ==========================================
-let sfConn = null;        // fully logged-in connection lang ang nandito
-let loginPromise = null;  // kapag may nagla-login na, doon lahat sasabay
+let sfConn = null;        // only ever holds a fully logged-in connection
+let loginPromise = null;  // in-flight login; concurrent requests wait on this
 
 function sfBaseUrl() {
   let url = process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com';
@@ -25,7 +19,7 @@ function sfBaseUrl() {
 
 async function getSalesforceConnection() {
   if (sfConn) return sfConn;
-  if (loginPromise) return loginPromise; // iisang login lang kahit sabay-sabay ang requests
+  if (loginPromise) return loginPromise; // only one login even if requests arrive at the same time
 
   loginPromise = (async () => {
     const conn = new jsforce.Connection({ loginUrl: sfBaseUrl(), version: '57.0' });
@@ -36,7 +30,7 @@ async function getSalesforceConnection() {
     if (conn.instanceUrl && !conn.instanceUrl.startsWith('http')) {
       conn.instanceUrl = `https://${conn.instanceUrl}`;
     }
-    sfConn = conn; // i-set lang kapag tapos na ang login
+    sfConn = conn; // publish the connection only after login has completed
     console.log('Salesforce login OK:', conn.instanceUrl);
     return conn;
   })().finally(() => { loginPromise = null; });
@@ -44,7 +38,7 @@ async function getSalesforceConnection() {
   return loginPromise;
 }
 
-// Gamitin ito sa LAHAT ng SF calls. May isang auto-retry kapag expired/sira ang session.
+// Use this for ALL Salesforce calls. Retries once if the session is expired/invalid.
 async function withSf(fn) {
   let conn = await getSalesforceConnection();
   try {
@@ -52,7 +46,7 @@ async function withSf(fn) {
   } catch (err) {
     const msg = err && err.message ? err.message : '';
     if (err.errorCode === 'INVALID_SESSION_ID' || /session|Failed to parse URL/i.test(msg)) {
-      if (sfConn === conn) sfConn = null; // i-reset lang kung ito pa rin ang global
+      if (sfConn === conn) sfConn = null; // only reset if this is still the shared connection
       conn = await getSalesforceConnection();
       return await fn(conn);
     }
@@ -96,9 +90,9 @@ const str = v => (v === undefined || v === null) ? "" : String(v);
 
 // ==========================================
 // CASE FIELD RESOLUTION (describe-based)
-// Hindi na hardcoded ang query. Mga field na talagang existing
-// (at may access) lang ang isasama, kaya hindi na masisira
-// ang buong form dahil sa isang maling field name.
+// The query is not hardcoded. Only fields that actually exist on Case
+// (and are visible to the integration user) are included, so one wrong
+// or inaccessible field can no longer break the whole form.
 // ==========================================
 const REFUND_FIELDS = {
   order_id:                         { names: ['Order_ID__c'] },
@@ -144,11 +138,11 @@ async function loadCaseFieldMeta() {
           }
           if (!f && def.match) f = desc.fields.find(x => def.match.test(x.name));
           if (f) resolved[key] = f;
-          else console.warn(`⚠️ Walang nahanap na SF field para sa "${key}" (tinry: ${def.names.join(', ')})`);
+          else console.warn(`⚠️ No matching Salesforce field found for "${key}" (tried: ${def.names.join(', ')})`);
         }
 
         const hints = desc.fields.filter(f => /reimburs|stripe/i.test(f.name)).map(f => f.name);
-        console.log('Case fields na may "reimburs/stripe":', hints.join(', ') || '(wala)');
+        console.log('Case fields matching "reimburs/stripe":', hints.join(', ') || '(none)');
 
         caseMeta = { byLower, resolved };
         return caseMeta;
@@ -280,11 +274,11 @@ app.post('/intercom/initialize', async (req, res) => {
           refund_complete: rc === true ? "Yes" : rc === false ? "No" : ""
         };
       } else {
-        notice = "⚠️ Hindi nahanap ang Salesforce ticket";
+        notice = "⚠️ Salesforce ticket not found";
       }
     } catch (err) {
       console.error("Refund App Initialize Error:", err.message);
-      notice = `⚠️ Hindi ma-load ang data mula sa Salesforce: ${err.message}`;
+      notice = `⚠️ Could not load data from Salesforce: ${err.message}`;
     }
   }
 
@@ -298,7 +292,7 @@ app.post('/intercom/submit', async (req, res) => {
 
   try {
     if (!sfCaseId) {
-      throw new Error("Walang linked na Salesforce ticket sa conversation na ito");
+      throw new Error("No Salesforce ticket is linked to this conversation");
     }
 
     const meta = await loadCaseFieldMeta();
@@ -313,7 +307,7 @@ app.post('/intercom/submit', async (req, res) => {
       if (def.boolean) {
         if (inputs[key] === "Yes") sfData[f.name] = true;
         else if (inputs[key] === "No") sfData[f.name] = false;
-        // blank = huwag galawin
+        // blank = leave the field untouched
       } else if (def.numeric) {
         sfData[f.name] = safeParseFloat(inputs[key]);
       } else {
@@ -325,7 +319,7 @@ app.post('/intercom/submit', async (req, res) => {
     console.log(`Successfully updated Refund details for Case ${sfCaseId}`);
 
     let msg = "✅ Refund details updated to Salesforce ticket";
-    if (skipped.length > 0) msg += ` (hindi na-save: ${skipped.join(', ')})`;
+    if (skipped.length > 0) msg += ` (not saved: ${skipped.join(', ')})`;
 
     res.json({ canvas: { content: { components: buildRefundForm(inputs, msg) } } });
   } catch (error) {
@@ -443,7 +437,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
   return components;
 }
 
-// Contact/Account details -> values (bawat isa hiwalay, hindi nagpapabagsak sa isa't isa)
+// Map Contact/Account records into form values (handled separately so one failure doesn't affect the other)
 function applyContactValues(target, c) {
   target.contact_search_term = c.Name || "";
   target.contact_email = c.Email || "N/A";
@@ -502,11 +496,11 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
           }
         }
       } else {
-        notice = "⚠️ Hindi nahanap ang Salesforce ticket";
+        notice = "⚠️ Salesforce ticket not found";
       }
     } catch (err) {
       console.error("Case Manager Initialize Error:", err.message);
-      notice = `⚠️ Hindi ma-load ang data mula sa Salesforce: ${err.message}`;
+      notice = `⚠️ Could not load data from Salesforce: ${err.message}`;
     }
   }
 
@@ -516,6 +510,10 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
 });
 
 // SUBMIT CASE MANAGER APP
+// NOTE: Intercom does NOT reliably send the dropdown's id as component_id when a
+// dropdown triggers a submit (only real buttons are reliable). So we never decide
+// what to save based on component_id. Instead we compare the submitted values with
+// what is currently on the Salesforce Case and save only what actually changed.
 app.post('/intercom/account-app/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
   const clickedButton = req.body.component_id;
@@ -523,12 +521,23 @@ app.post('/intercom/account-app/submit', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
   inputs.sfCaseId = sfCaseId;
 
+  console.log('CASE MGR SUBMIT', JSON.stringify({
+    component_id: clickedButton,
+    sfCaseId,
+    contact: inputs.selected_contact_id,
+    account: inputs.selected_account_id,
+    source: inputs.source
+  }));
+
   try {
     let contactList = [];
     let accountList = [];
     let contactAccountId = null;
 
-    // 1. SEARCH CONTACT (display lang, hindi nagse-save)
+    // Current values on the Salesforce Case (baseline for change detection)
+    const base = sfCaseId ? await fetchCase(sfCaseId) : null;
+
+    // 1. SEARCH CONTACT (first match is previewed and saved, agent can pick another)
     if (clickedButton === "search_contact_btn") {
       const searchTerm = (inputs.contact_search_term || "").trim();
       if (searchTerm) {
@@ -540,7 +549,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       }
     }
 
-    // 2. SEARCH ACCOUNT (display lang, hindi nagse-save)
+    // 2. SEARCH ACCOUNT
     if (clickedButton === "search_account_btn") {
       const searchTerm = (inputs.account_search_term || "").trim();
       if (searchTerm) {
@@ -553,6 +562,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
     }
 
     // 3. CONTACT RETRIEVAL
+    const contactChanged = isSfId(inputs.selected_contact_id) && (!base || inputs.selected_contact_id !== base.ContactId);
     if (isSfId(inputs.selected_contact_id)) {
       try {
         const targetContact = await withSf(conn => conn.sobject('Contact').retrieve(inputs.selected_contact_id));
@@ -561,8 +571,8 @@ app.post('/intercom/account-app/submit', async (req, res) => {
           applyContactValues(inputs, targetContact);
           contactAccountId = targetContact.AccountId || null;
 
-          // Auto-set ang account ng contact (pwede pa ring palitan ng agent)
-          if ((clickedButton === "search_contact_btn" || clickedButton === "selected_contact_id") && contactAccountId) {
+          // When the contact changes, auto-set the contact's account (agent can still change it)
+          if (contactChanged && contactAccountId) {
             inputs.selected_account_id = contactAccountId;
           }
         }
@@ -580,34 +590,45 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       } catch (aErr) { console.error("Account Retrieve Error:", aErr.message); }
     }
 
-    // BANNER
-    let updateNotice = "✅ Salesforce ticket updated";
-    if (clickedButton === "source") updateNotice = "✅ Source set to Salesforce ticket";
-    else if (clickedButton === "selected_contact_id") updateNotice = "✅ Contact updated to Salesforce ticket";
-    else if (clickedButton === "selected_account_id") updateNotice = "✅ Account updated to Salesforce ticket";
-    else if (clickedButton === "search_contact_btn") updateNotice = "🔍 Select matching contact below";
-    else if (clickedButton === "search_account_btn") updateNotice = "🔍 Select matching account below";
-
-    // SAVE: ang piniling field lang ang isusulat (walang nabubura)
+    // 5. SAVE: only fields that differ from what is on the Case
+    const changes = {};
     if (sfCaseId) {
-      const sfData = {};
-
-      if (clickedButton === "selected_contact_id" && isSfId(inputs.selected_contact_id)) {
-        sfData.ContactId = inputs.selected_contact_id;
-        if (contactAccountId) sfData.AccountId = contactAccountId;
-      } else if (clickedButton === "selected_account_id" && isSfId(inputs.selected_account_id)) {
-        sfData.AccountId = inputs.selected_account_id;
-      } else if (clickedButton === "source") {
-        sfData.Source__c = inputs.source || null;
+      if (isSfId(inputs.selected_contact_id) && (!base || inputs.selected_contact_id !== base.ContactId)) {
+        changes.ContactId = inputs.selected_contact_id;
+      }
+      if (isSfId(inputs.selected_account_id) && (!base || inputs.selected_account_id !== base.AccountId)) {
+        changes.AccountId = inputs.selected_account_id;
+      }
+      if (inputs.source !== undefined && (inputs.source || "") !== ((base && base.Source__c) || "")) {
+        changes.Source__c = inputs.source || null;
       }
 
-      if (Object.keys(sfData).length > 0) {
-        sfData.Id = sfCaseId;
-        await withSf(conn => conn.sobject('Case').update(sfData));
-        console.log(`Synced Case ${sfCaseId}:`, JSON.stringify(sfData));
+      if (Object.keys(changes).length > 0) {
+        await withSf(conn => conn.sobject('Case').update({ Id: sfCaseId, ...changes }));
+        console.log(`Synced Case ${sfCaseId}:`, JSON.stringify(changes));
       }
-    } else if (!String(clickedButton).startsWith('search_')) {
-      updateNotice = "⚠️ Walang linked na Salesforce ticket";
+    }
+
+    // BANNER (based on what was actually saved)
+    let updateNotice;
+    if (!sfCaseId) {
+      updateNotice = "⚠️ No Salesforce ticket linked";
+    } else if (clickedButton === "search_contact_btn") {
+      updateNotice = contactList.length > 0
+        ? "🔍 First match saved to ticket. Choose another below if needed"
+        : "🔍 No matching contact found";
+    } else if (clickedButton === "search_account_btn") {
+      updateNotice = accountList.length > 0
+        ? "🔍 First match saved to ticket. Choose another below if needed"
+        : "🔍 No matching account found";
+    } else if (changes.Source__c !== undefined) {
+      updateNotice = "✅ Source set to Salesforce ticket";
+    } else if (changes.ContactId) {
+      updateNotice = "✅ Contact updated to Salesforce ticket";
+    } else if (changes.AccountId) {
+      updateNotice = "✅ Account updated to Salesforce ticket";
+    } else {
+      updateNotice = "ℹ️ No changes to save";
     }
 
     res.json({
@@ -621,12 +642,12 @@ app.post('/intercom/account-app/submit', async (req, res) => {
   }
 });
 
-// Health check (para sa Render)
+// Health check (for Render)
 app.get('/', (req, res) => res.send('OK'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
-  // Warm-up: mag-login at mag-describe na agad para mabilis ang unang request
+  // Warm-up: log in and describe Case at startup so the first request is fast
   loadCaseFieldMeta().catch(e => console.error('Warm-up error:', e.message));
 });
