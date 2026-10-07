@@ -11,7 +11,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Reusable JSForce Connection
+// Reusable JSForce Connection Instance
 let sfConn = null;
 
 async function getSalesforceConnection() {
@@ -32,96 +32,19 @@ async function getSalesforceConnection() {
   return sfConn;
 }
 
-// Helper function to build Canvas Kit UI
-function buildRefundForm(values = {}, options = {}, successMessage = null) {
+// Helper function to build Intercom Canvas Kit UI
+function buildRefundForm(values = {}) {
   const components = [];
 
-  if (successMessage) {
-    components.push({
-      type: "text",
-      text: successMessage,
-      style: "header"
-    });
-  } else {
-    components.push({
-      type: "text",
-      text: "Process Refund Request",
-      style: "header"
-    });
-  }
-
-  // -------------------------------------------------------------
-  // 1. CONTACT NAME SECTION (Search Contact)
-  // -------------------------------------------------------------
   components.push(
-    { type: "input", id: "contact_search_term", label: "Contact Name", value: values.contact_search_term || "", placeholder: "Search SF Contact..." },
-    { type: "button", id: "search_contact_btn", label: "🔍 Search Contact", style: "secondary", action: { type: "submit" } }
-  );
-
-  if (options.contactList && options.contactList.length > 0) {
-    const contactDropdown = options.contactList.map(c => ({
-      type: "option",
-      id: c.Id,
-      text: `${c.Name} (${c.Email || 'No Email'})`
-    }));
-
-    components.push({
-      type: "dropdown",
-      id: "selected_contact_id",
-      label: "Select Contact Result",
-      options: contactDropdown,
-      value: values.selected_contact_id || contactDropdown[0].id
-    });
-  } else if (values.selected_contact_name) {
-    components.push({
-      type: "text",
-      text: `Selected Contact: ${values.selected_contact_name}`,
-      style: "paragraph"
-    });
-  }
-
-  // -------------------------------------------------------------
-  // 2. ACCOUNT NAME SECTION (Search Account)
-  // -------------------------------------------------------------
-  components.push(
-    { type: "input", id: "account_search_term", label: "Account Name", value: values.account_search_term || values.account_name || "", placeholder: "Search SF Account..." },
-    { type: "button", id: "search_account_btn", label: "🔍 Search Account", style: "secondary", action: { type: "submit" } }
-  );
-
-  if (options.accountList && options.accountList.length > 0) {
-    const accountDropdown = options.accountList.map(a => ({
-      type: "option",
-      id: a.Id,
-      text: `${a.Name} (${a.Account_Status__c || 'No Status'})`
-    }));
-
-    components.push({
-      type: "dropdown",
-      id: "selected_account_id",
-      label: "Select Account Result",
-      options: accountDropdown,
-      value: values.selected_account_id || accountDropdown[0].id
-    });
-  }
-
-  // -------------------------------------------------------------
-  // 3. ACCOUNT STATUS (Auto-populated or Editable)
-  // -------------------------------------------------------------
-  components.push(
-    { type: "input", id: "account_status", label: "Account Status", value: values.account_status || "" }
-  );
-
-  components.push({ type: "divider" });
-
-  // -------------------------------------------------------------
-  // 4. ORDER & REFUND DETAILS
-  // -------------------------------------------------------------
-  components.push(
+    // 1. Order ID (Primary Field sa Pinakataas)
     { type: "input", id: "order_id", label: "Order ID", value: values.order_id || "" },
+    
+    // 2. Date of Order & Guest Details
     { type: "input", id: "date_of_order", label: "Date of Order", value: values.date_of_order || "", placeholder: "YYYY-MM-DD" },
     { type: "input", id: "guest_name", label: "Guest Name", value: values.guest_name || "" },
     
-    // Dropdown Component for Order Type
+    // 3. Order Type Dropdown
     {
       type: "dropdown",
       id: "order_type",
@@ -135,9 +58,10 @@ function buildRefundForm(values = {}, options = {}, successMessage = null) {
       value: values.order_type || "Delivery"
     },
 
+    // 4. Delivery & Dispute Details
     { type: "input", id: "delivery_order_id", label: "Delivery Order ID", value: values.delivery_order_id || "" },
     
-    // Dropdown Component for Delivery Partner
+    // 5. Delivery Partner Dropdown
     {
       type: "dropdown",
       id: "delivery_partner",
@@ -157,7 +81,7 @@ function buildRefundForm(values = {}, options = {}, successMessage = null) {
     { type: "textarea", id: "refund_reason_notes", label: "Refund Reason Notes", value: values.refund_reason_notes || "" },
     { type: "input", id: "third_party_reimbursement_amount", label: "3rd Party Reimbursement Amount", value: values.third_party_reimbursement_amount || "" },
     
-    // Dropdown Component for 3rd Party Reimbursement Status
+    // 6. 3rd Party Reimbursement Status Dropdown
     {
       type: "dropdown",
       id: "third_party_reimbursement_status",
@@ -173,7 +97,7 @@ function buildRefundForm(values = {}, options = {}, successMessage = null) {
 
     { type: "input", id: "stripe_reimbursement_link", label: "Stripe Reimbursement Link", value: values.stripe_reimbursement_link || "" },
     
-    // Dropdown Component for Refund Complete
+    // 7. Refund Complete Dropdown
     {
       type: "dropdown",
       id: "refund_complete",
@@ -192,41 +116,21 @@ function buildRefundForm(values = {}, options = {}, successMessage = null) {
   return components;
 }
 
-// 1. INITIALIZE FLOW
+// 1. INITIALIZE FLOW (Pre-populate existing data from Salesforce Case on hard refresh)
 app.post('/intercom/initialize', async (req, res) => {
   const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
                 || req.body.custom_attributes?.salesforce_id
                 || req.body.customer?.custom_attributes?.salesforce_id;
 
-  const sfAccountId = req.body.conversation?.custom_attributes?.salesforce_account_id 
-                   || req.body.custom_attributes?.salesforce_account_id
-                   || req.body.customer?.custom_attributes?.salesforce_account_id;
-
   let existingValues = {};
 
-  try {
-    const conn = await getSalesforceConnection();
-
-    // Default Account Name at Status mula sa Intercom salesforce_account_id
-    if (sfAccountId) {
-      try {
-        const sfAccount = await conn.sobject('Account').retrieve(sfAccountId);
-        if (sfAccount) {
-          existingValues.account_name = sfAccount.Name || "";
-          existingValues.account_status = sfAccount.Account_Status__c || "";
-          existingValues.selected_account_id = sfAccountId;
-        }
-      } catch (accErr) {
-        console.error("Account Fetch Error:", accErr.message);
-      }
-    }
-
-    // Fetch existing Case details
-    if (sfCaseId) {
+  if (sfCaseId) {
+    try {
+      const conn = await getSalesforceConnection();
       const sfRecord = await conn.sobject('Case').retrieve(sfCaseId);
+
       if (sfRecord) {
         existingValues = {
-          ...existingValues,
           order_id: sfRecord.Order_ID__c || "",
           date_of_order: sfRecord.Date_of_Order__c || "",
           guest_name: sfRecord.Guest_Name__c || "",
@@ -237,21 +141,15 @@ app.post('/intercom/initialize', async (req, res) => {
           amount_issued_account: sfRecord.Amount_Issued_to_Customer_Account__c ? String(sfRecord.Amount_Issued_to_Customer_Account__c) : "",
           amount_issued_guest: sfRecord.Amount_Issued_to_Guest__c ? String(sfRecord.Amount_Issued_to_Guest__c) : "",
           refund_reason_notes: sfRecord.Refund_Reason_Notes__c || "",
-          refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No",
-          selected_contact_id: sfRecord.ContactId || ""
+          third_party_reimbursement_amount: sfRecord.Third_Party_Reimbursement_Amount__c ? String(sfRecord.Third_Party_Reimbursement_Amount__c) : "",
+          third_party_reimbursement_status: sfRecord.Third_Party_Reimbursement_Status__c || "",
+          stripe_reimbursement_link: sfRecord.Stripe_Reimbursement_Link__c || "",
+          refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
         };
-
-        if (sfRecord.ContactId) {
-          const contactRec = await conn.sobject('Contact').retrieve(sfRecord.ContactId);
-          if (contactRec) {
-            existingValues.contact_search_term = contactRec.Name;
-            existingValues.selected_contact_name = contactRec.Name;
-          }
-        }
       }
+    } catch (err) {
+      console.error("Error fetching existing record on initialize:", err.message);
     }
-  } catch (err) {
-    console.error("Error on initialize:", err.message);
   }
 
   res.json({
@@ -263,65 +161,19 @@ app.post('/intercom/initialize', async (req, res) => {
   });
 });
 
-// 2. SUBMIT FLOW (Handles Contact Search, Account Search, or Ticket Update)
+// 2. SUBMIT FLOW (Sync updates to Salesforce Case)
 app.post('/intercom/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
-  const clickedButton = req.body.component_id;
   
   const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
                 || req.body.custom_attributes?.salesforce_id
                 || req.body.customer?.custom_attributes?.salesforce_id;
 
+  console.log("Detected Salesforce Case ID:", sfCaseId);
+
   try {
     const conn = await getSalesforceConnection();
 
-    // CASE A: SEARCH CONTACT
-    if (clickedButton === "search_contact_btn") {
-      const searchTerm = (inputs.contact_search_term || "").trim();
-      let contactList = [];
-
-      if (searchTerm) {
-        const query = `SELECT Id, Name, Email FROM Contact WHERE Name LIKE '%${searchTerm}%' LIMIT 10`;
-        const result = await conn.query(query);
-        contactList = result.records || [];
-      }
-
-      return res.json({
-        canvas: {
-          content: {
-            components: buildRefundForm(inputs, { contactList }, contactList.length > 0 ? `Found ${contactList.length} matching contacts:` : "No contacts found.")
-          }
-        }
-      });
-    }
-
-    // CASE B: SEARCH ACCOUNT (Kukunin din ang Account_Status__c)
-    if (clickedButton === "search_account_btn") {
-      const searchTerm = (inputs.account_search_term || "").trim();
-      let accountList = [];
-
-      if (searchTerm) {
-        const query = `SELECT Id, Name, Account_Status__c FROM Account WHERE Name LIKE '%${searchTerm}%' LIMIT 10`;
-        const result = await conn.query(query);
-        accountList = result.records || [];
-
-        // Kung may lumabas na pumasok na account, kuhanin ang status ng kauna-unahang resulta
-        if (accountList.length > 0) {
-          inputs.account_status = accountList[0].Account_Status__c || "";
-          inputs.account_name = accountList[0].Name;
-        }
-      }
-
-      return res.json({
-        canvas: {
-          content: {
-            components: buildRefundForm(inputs, { accountList }, accountList.length > 0 ? `Found ${accountList.length} matching accounts:` : "No accounts found.")
-          }
-        }
-      });
-    }
-
-    // CASE C: UPDATE / CREATE SALESFORCE TICKET
     const sfData = {
       Order_ID__c: inputs.order_id || null,
       Date_of_Order__c: inputs.date_of_order || null,
@@ -333,16 +185,11 @@ app.post('/intercom/submit', async (req, res) => {
       Amount_Issued_to_Customer_Account__c: inputs.amount_issued_account ? parseFloat(inputs.amount_issued_account) : null,
       Amount_Issued_to_Guest__c: inputs.amount_issued_guest ? parseFloat(inputs.amount_issued_guest) : null,
       Refund_Reason_Notes__c: inputs.refund_reason_notes || null,
+      Third_Party_Reimbursement_Amount__c: inputs.third_party_reimbursement_amount ? parseFloat(inputs.third_party_reimbursement_amount) : null,
+      Third_Party_Reimbursement_Status__c: inputs.third_party_reimbursement_status || null,
+      Stripe_Reimbursement_Link__c: inputs.stripe_reimbursement_link || null,
       Refund_Complete__c: inputs.refund_complete === "Yes"
     };
-
-    if (inputs.selected_contact_id) {
-      sfData.ContactId = inputs.selected_contact_id;
-    }
-
-    if (inputs.selected_account_id) {
-      sfData.AccountId = inputs.selected_account_id;
-    }
 
     if (sfCaseId) {
       sfData.Id = sfCaseId;
@@ -356,19 +203,19 @@ app.post('/intercom/submit', async (req, res) => {
     res.json({
       canvas: {
         content: {
-          components: buildRefundForm(inputs, {}, "✅ Successfully Synced to Salesforce QA!")
+          components: buildRefundForm(inputs)
         }
       }
     });
 
   } catch (error) {
     console.error("Salesforce Push Error:", error);
-    sfConn = null;
+    sfConn = null; // Reset connection on failure
 
     res.json({
       canvas: {
         content: {
-          components: buildRefundForm(inputs, {}, `❌ Sync Error: ${error.message}`)
+          components: buildRefundForm(inputs)
         }
       }
     });
