@@ -409,6 +409,8 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
   components.push(
     { type: "text", text: `*Account Status:* ${values.account_status || 'N/A'}`, style: "paragraph" },
     { type: "text", text: `*Partner Level:* ${values.partner_level || 'N/A'}`, style: "paragraph" },
+    { type: "text", text: `*GP Score:* ${values.gp_score || 'N/A'}`, style: "paragraph" },
+    { type: "text", text: `*Next Stripe Invoice Date:* ${values.next_stripe_invoice_date || 'N/A'}`, style: "paragraph" },
     { type: "text", text: `*Website:* ${values.website || 'N/A'}`, style: "paragraph" },
     { type: "text", text: `*Dashboard URL:* ${values.dashboard_url || 'N/A'}`, style: "paragraph" },
     { type: "text", text: `*Billing Address:* ${values.billing_address || 'N/A'}`, style: "paragraph" },
@@ -438,6 +440,13 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
 }
 
 // Map Contact/Account records into form values (handled separately so one failure doesn't affect the other)
+// Show dates as YYYY-MM-DD (works for both Date and DateTime fields)
+function formatDateValue(v) {
+  if (!v) return "N/A";
+  const s = String(v);
+  return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : s;
+}
+
 function applyContactValues(target, c) {
   target.contact_search_term = c.Name || "";
   target.contact_email = c.Email || "N/A";
@@ -449,6 +458,8 @@ function applyAccountValues(target, a) {
   target.account_search_term = a.Name || "";
   target.account_status = a.Account_Status__c || "N/A";
   target.partner_level = a.Partner_Level__c || "N/A";
+  target.gp_score = (a.GP_Score__c === undefined || a.GP_Score__c === null) ? "N/A" : String(a.GP_Score__c); // 0 is a valid score
+  target.next_stripe_invoice_date = formatDateValue(a.next_stripe_invoice_date__c);
   target.website = a.Website || "N/A";
   target.dashboard_url = a.Dashboard_URL__c || "N/A";
   target.billing_address = formatAddress(a.BillingAddress);
