@@ -11,14 +11,18 @@ app.use((req, res, next) => {
   next();
 });
 
-// Reusable JSForce Connection
+// Reusable JSForce Connection with strict URL formatting
 let sfConn = null;
 
 async function getSalesforceConnection() {
-  if (sfConn && sfConn.accessToken) return sfConn;
+  if (sfConn && sfConn.accessToken && sfConn.instanceUrl) {
+    return sfConn;
+  }
+  
+  const loginUrl = process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com';
   
   sfConn = new jsforce.Connection({
-    loginUrl: process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com',
+    loginUrl: loginUrl.startsWith('http') ? loginUrl : `https://${loginUrl}`,
     version: '57.0'
   });
 
@@ -35,16 +39,6 @@ function formatAddress(addr) {
   if (typeof addr === 'string') return addr;
   const parts = [addr.street, addr.city, addr.state, addr.postalCode, addr.country].filter(Boolean);
   return parts.length > 0 ? parts.join(', ') : "N/A";
-}
-
-// Helper: Parse Related_Account_IDs__c (Handles comma-separated string or array)
-function parseRelatedAccountIds(rawVal) {
-  if (!rawVal) return [];
-  if (Array.isArray(rawVal)) return rawVal;
-  return String(rawVal)
-    .split(/[\s,;]+/)
-    .map(id => id.trim())
-    .filter(id => id.length >= 15); // Valid Salesforce ID length check
 }
 
 // ==========================================
@@ -140,7 +134,7 @@ app.post('/intercom/initialize', async (req, res) => {
           refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
         };
       }
-    } catch (err) { console.error(err.message); }
+    } catch (err) { console.error("Initialize Case Fetch Error:", err.message); }
   }
   res.json({ canvas: { content: { components: buildRefundForm(existingValues) } } });
 });
@@ -212,7 +206,7 @@ function buildAccountContactUI(values = {}, options = {}) {
   components.push({ type: "text", text: `*Contact Status:* ${values.contact_status || 'N/A'}`, style: "paragraph" });
   components.push({ type: "divider" });
 
-  // 2. ACCOUNT SEARCH & RELATED ACCOUNTS DROPDOWN
+  // 2. ACCOUNT SEARCH & DROPDOWN BLOCK
   components.push(
     { type: "input", id: "account_search_term", label: "Search Account", value: values.account_search_term || "", placeholder: "Type account name..." },
     { type: "button", id: "search_account_btn", label: "🔍 Search Account", style: "primary", action: { type: "submit" } }
@@ -227,7 +221,7 @@ function buildAccountContactUI(values = {}, options = {}) {
     components.push({
       type: "dropdown",
       id: "selected_account_id",
-      label: options.isRelatedAccount ? "Select Related Account" : "Select Matching Account",
+      label: "Select Matching Account",
       options: accountDropdown,
       value: values.selected_account_id || accountDropdown[0].id
     });
@@ -295,7 +289,7 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
           initialValues.source = sfCase.Source__c || "";
           initialValues.selected_contact_id = sfCase.ContactId || "";
         }
-      } catch (caseErr) { console.error("Case Fetch Error:", caseErr.message); }
+      } catch (caseErr) { console.error("Case Retrieve Error:", caseErr.message); }
     }
 
     if (sfAccountId) {
@@ -313,7 +307,7 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
             selected_account_id: sfAccountId
           };
         }
-      } catch (accErr) { console.error("Account Fetch Error:", accErr.message); }
+      } catch (accErr) { console.error("Account Retrieve Error:", accErr.message); }
     }
   } catch (err) { console.error("Initialize Error:", err.message); }
 
@@ -337,15 +331,14 @@ app.post('/intercom/account-app/submit', async (req, res) => {
   try {
     const conn = await getSalesforceConnection();
 
-    // 1. SEARCH CONTACT & AUTO-FETCH RELATED ACCOUNTS
+    // 1. SEARCH CONTACT (Auto-fetches Primary Account)
     if (clickedButton === "search_contact_btn") {
       const searchTerm = (inputs.contact_search_term || "").trim();
       let contactList = [];
       let accountList = [];
-      let isRelatedAccount = false;
 
       if (searchTerm) {
-        const query = `SELECT Id, Name, Email, Phone, Contact_Status__c, AccountId, Account.Name, Related_Account_IDs__c FROM Contact WHERE Name LIKE '%${searchTerm}%' OR Email LIKE '%${searchTerm}%' OR Phone LIKE '%${searchTerm}%' LIMIT 10`;
+        const query = `SELECT Id, Name, Email, Phone, Contact_Status__c, AccountId FROM Contact WHERE Name LIKE '%${searchTerm}%' OR Email LIKE '%${searchTerm}%' OR Phone LIKE '%${searchTerm}%' LIMIT 10`;
         const result = await conn.query(query);
         contactList = result.records || [];
 
@@ -353,38 +346,29 @@ app.post('/intercom/account-app/submit', async (req, res) => {
           const matchedContact = contactList[0];
           inputs.contact_status = matchedContact.Contact_Status__c || "N/A";
 
-          // Extract primary AccountId and Related_Account_IDs__c
-          const relatedIds = parseRelatedAccountIds(matchedContact.Related_Account_IDs__c);
-          if (matchedContact.AccountId && !relatedIds.includes(matchedContact.AccountId)) {
-            relatedIds.unshift(matchedContact.AccountId);
-          }
-
-          // If related account IDs exist, fetch ONLY those accounts
-          if (relatedIds.length > 0) {
-            const idListStr = relatedIds.map(id => `'${id}'`).join(',');
-            const accQuery = `SELECT Id, Name, Account_Status__c, Partner_Level__c, Website, Dashboard_URL__c, BillingAddress FROM Account WHERE Id IN (${idListStr})`;
-            const accResult = await conn.query(accQuery);
-            accountList = accResult.records || [];
-            isRelatedAccount = true;
-
-            if (accountList.length > 0) {
-              const topAcc = accountList[0];
-              inputs.selected_account_id = topAcc.Id;
-              inputs.account_search_term = topAcc.Name;
-              inputs.account_status = topAcc.Account_Status__c || "N/A";
-              inputs.partner_level = topAcc.Partner_Level__c || "N/A";
-              inputs.website = topAcc.Website || "N/A";
-              inputs.dashboard_url = topAcc.Dashboard_URL__c || "N/A";
-              inputs.billing_address = formatAddress(topAcc.BillingAddress);
-            }
+          // Auto-fetch the Contact's default primary Account if available
+          if (matchedContact.AccountId) {
+            try {
+              const accRecord = await conn.sobject('Account').retrieve(matchedContact.AccountId);
+              if (accRecord) {
+                accountList = [accRecord];
+                inputs.selected_account_id = accRecord.Id;
+                inputs.account_search_term = accRecord.Name;
+                inputs.account_status = accRecord.Account_Status__c || "N/A";
+                inputs.partner_level = accRecord.Partner_Level__c || "N/A";
+                inputs.website = accRecord.Website || "N/A";
+                inputs.dashboard_url = accRecord.Dashboard_URL__c || "N/A";
+                inputs.billing_address = formatAddress(accRecord.BillingAddress);
+              }
+            } catch (aErr) { console.error("Contact Account Fetch Error:", aErr.message); }
           }
         }
       }
 
-      return res.json({ canvas: { content: { components: buildAccountContactUI(inputs, { contactList, accountList, isRelatedAccount }) } } });
+      return res.json({ canvas: { content: { components: buildAccountContactUI(inputs, { contactList, accountList }) } } });
     }
 
-    // 2. SEARCH ACCOUNT (Manual Search fallback)
+    // 2. SEARCH ACCOUNT (Manual Search fallback option)
     if (clickedButton === "search_account_btn") {
       const searchTerm = (inputs.account_search_term || "").trim();
       let accountList = [];
@@ -420,10 +404,10 @@ app.post('/intercom/account-app/submit', async (req, res) => {
     if (sfCaseId) {
       sfData.Id = sfCaseId;
       await conn.sobject('Case').update(sfData);
-      console.log(`Successfully Updated Case ${sfCaseId} from Case Manager App`);
+      console.log(`Successfully Updated Case ${sfCaseId}`);
     } else {
       const result = await conn.sobject('Case').create(sfData);
-      console.log(`Created New Case ${result.id} from Case Manager App`);
+      console.log(`Created New Case ${result.id}`);
     }
 
     res.json({ canvas: { content: { components: buildAccountContactUI(inputs) } } });
@@ -437,3 +421,4 @@ app.post('/intercom/account-app/submit', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
