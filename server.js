@@ -440,6 +440,13 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
 }
 
 // Map Contact/Account records into form values (handled separately so one failure doesn't affect the other)
+// Related_Account_IDs__c on Contact is a long text field with comma/space/newline separated Account IDs
+function parseRelatedAccountIds(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.filter(isSfId);
+  return String(raw).split(/[\s,;]+/).map(x => x.trim()).filter(isSfId);
+}
+
 // Show dates as YYYY-MM-DD (works for both Date and DateTime fields)
 function formatDateValue(v) {
   if (!v) return "N/A";
@@ -580,10 +587,25 @@ app.post('/intercom/account-app/submit', async (req, res) => {
         if (targetContact) {
           if (contactList.length === 0) contactList = [targetContact];
           applyContactValues(inputs, targetContact);
-          contactAccountId = targetContact.AccountId || null;
+          // Default account of the contact: standard AccountId first, otherwise the
+          // first ID listed in Related_Account_IDs__c
+          const related = parseRelatedAccountIds(targetContact.Related_Account_IDs__c);
+          contactAccountId = targetContact.AccountId || related[0] || null;
 
-          // When the contact changes, auto-set the contact's account (agent can still change it)
-          if (contactChanged && contactAccountId) {
+          console.log('CONTACT->ACCOUNT', JSON.stringify({
+            contact: targetContact.Id,
+            contactChanged,
+            contactAccountIdField: targetContact.AccountId || null,
+            relatedAccountIds: related,
+            chosen: contactAccountId
+          }));
+
+          // When the contact changes (or a contact search was clicked, or the Case has no
+          // account yet), auto-set the contact's default account. The account in the form
+          // payload can be stale (e.g. a repeated request), so a contact search must always
+          // derive the account from the contact, never from the form. The agent can still
+          // change the account afterwards.
+          if (contactAccountId && (contactChanged || clickedButton === "search_contact_btn" || !isSfId(inputs.selected_account_id))) {
             inputs.selected_account_id = contactAccountId;
           }
         }
@@ -634,8 +656,12 @@ app.post('/intercom/account-app/submit', async (req, res) => {
         : "🔍 No matching account found";
     } else if (changes.Source__c !== undefined) {
       updateNotice = "✅ Source set to Salesforce ticket";
+    } else if (changes.ContactId && changes.AccountId) {
+      updateNotice = "✅ Contact and account updated to Salesforce ticket";
     } else if (changes.ContactId) {
-      updateNotice = "✅ Contact updated to Salesforce ticket";
+      updateNotice = contactAccountId
+        ? "✅ Contact updated to Salesforce ticket"
+        : "✅ Contact updated (this contact has no account on file, so the account was not changed)";
     } else if (changes.AccountId) {
       updateNotice = "✅ Account updated to Salesforce ticket";
     } else {
