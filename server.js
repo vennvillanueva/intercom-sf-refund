@@ -190,7 +190,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     });
   }
 
-  // 1. GO TO SALESFORCE TICKET BUTTON
+  // 1. GO TO SALESFORCE TICKET BUTTON (Set to Primary Style)
   if (values.sfCaseId) {
     const sfDomain = process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com';
     const caseUrl = `${sfDomain}/${values.sfCaseId}`;
@@ -199,7 +199,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
         type: "button",
         id: "open_sf_ticket_btn",
         label: "🔗 Go to Salesforce Ticket",
-        style: "secondary",
+        style: "primary", // Updated to primary for higher visual prominence
         action: {
           type: "url",
           url: caseUrl
