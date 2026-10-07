@@ -41,6 +41,19 @@ function formatAddress(addr) {
   return parts.length > 0 ? parts.join(', ') : "N/A";
 }
 
+// Helper: Extract Salesforce Case ID from all possible Intercom payload paths
+function extractSfCaseId(body) {
+  return body.conversation?.custom_attributes?.salesforce_id
+      || body.conversation?.custom_attributes?.salesforce_case_id
+      || body.conversation?.custom_attributes?.sf_case_id
+      || body.custom_attributes?.salesforce_id
+      || body.custom_attributes?.salesforce_case_id
+      || body.customer?.custom_attributes?.salesforce_id
+      || body.customer?.custom_attributes?.salesforce_case_id
+      || body.user?.custom_attributes?.salesforce_id
+      || body.user?.custom_attributes?.salesforce_case_id;
+}
+
 // ==========================================
 // APP 1: REFUND APP (Form & Endpoints)
 // ==========================================
@@ -108,9 +121,7 @@ function buildRefundForm(values = {}) {
 }
 
 app.post('/intercom/initialize', async (req, res) => {
-  const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
-                || req.body.custom_attributes?.salesforce_id
-                || req.body.customer?.custom_attributes?.salesforce_id;
+  const sfCaseId = extractSfCaseId(req.body);
   let existingValues = {};
   if (sfCaseId) {
     try {
@@ -141,9 +152,7 @@ app.post('/intercom/initialize', async (req, res) => {
 
 app.post('/intercom/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
-  const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
-                || req.body.custom_attributes?.salesforce_id
-                || req.body.customer?.custom_attributes?.salesforce_id;
+  const sfCaseId = extractSfCaseId(req.body);
   try {
     const conn = await getSalesforceConnection();
     const sfData = {
@@ -190,7 +199,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     });
   }
 
-  // 1. GO TO SALESFORCE TICKET BUTTON (Set to Primary Style)
+  // 1. GO TO SALESFORCE TICKET BUTTON
   if (values.sfCaseId) {
     const sfDomain = process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com';
     const caseUrl = `${sfDomain}/${values.sfCaseId}`;
@@ -199,7 +208,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
         type: "button",
         id: "open_sf_ticket_btn",
         label: "🔗 Go to Salesforce Ticket",
-        style: "primary", // Updated to primary for higher visual prominence
+        style: "primary",
         action: {
           type: "url",
           url: caseUrl
@@ -289,11 +298,9 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
   return components;
 }
 
-// INITIALIZE FLOW
+// INITIALIZE FLOW (Robust Search across all possible Salesforce Case ID locations)
 app.post('/intercom/account-app/initialize', async (req, res) => {
-  const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
-                || req.body.custom_attributes?.salesforce_id
-                || req.body.customer?.custom_attributes?.salesforce_id;
+  const sfCaseId = extractSfCaseId(req.body);
 
   let initialValues = { sfCaseId };
   let contactList = [];
@@ -361,10 +368,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
   const clickedButton = req.body.component_id;
 
-  const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
-                || req.body.custom_attributes?.salesforce_id
-                || req.body.customer?.custom_attributes?.salesforce_id;
-
+  const sfCaseId = extractSfCaseId(req.body);
   inputs.sfCaseId = sfCaseId;
 
   try {
@@ -482,4 +486,3 @@ app.post('/intercom/account-app/submit', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
-
