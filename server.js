@@ -191,10 +191,29 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     });
   }
 
-  // 1. CONTACT SEARCH BLOCK
+  // 1. GO TO SALESFORCE TICKET BUTTON (Pinakataas na bahagi)
+  if (values.sfCaseId) {
+    const sfDomain = process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com';
+    const caseUrl = `${sfDomain}/${values.sfCaseId}`;
+    components.push(
+      {
+        type: "button",
+        id: "open_sf_ticket_btn",
+        label: "🔗 Go to Salesforce Ticket",
+        style: "secondary",
+        action: {
+          type: "url",
+          url: caseUrl
+        }
+      },
+      { type: "divider" }
+    );
+  }
+
+  // 2. CONTACT SEARCH BLOCK (Secondary / Gray Style Search Button)
   components.push(
     { type: "input", id: "contact_search_term", label: "Search Contact", value: values.contact_search_term || "", placeholder: "Name, email, or phone..." },
-    { type: "button", id: "search_contact_btn", label: "🔍 Search Contact", style: "primary", action: { type: "submit" } }
+    { type: "button", id: "search_contact_btn", label: "🔍 Search Contact", style: "secondary", action: { type: "submit" } }
   );
 
   if (options.contactList && options.contactList.length > 0) {
@@ -212,13 +231,18 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     });
   }
 
-  components.push({ type: "text", text: `*Contact Status:* ${values.contact_status || 'N/A'}`, style: "paragraph" });
-  components.push({ type: "divider" });
+  // Contact Details Display: Email, Phone, & Status
+  components.push(
+    { type: "text", text: `*Contact Email:* ${values.contact_email || 'N/A'}`, style: "paragraph" },
+    { type: "text", text: `*Contact Phone:* ${values.contact_phone || 'N/A'}`, style: "paragraph" },
+    { type: "text", text: `*Contact Status:* ${values.contact_status || 'N/A'}`, style: "paragraph" },
+    { type: "divider" }
+  );
 
-  // 2. ACCOUNT SEARCH & DROPDOWN BLOCK
+  // 3. ACCOUNT SEARCH & DROPDOWN BLOCK (Secondary / Gray Style Search Button)
   components.push(
     { type: "input", id: "account_search_term", label: "Search Account", value: values.account_search_term || "", placeholder: "Type account name..." },
-    { type: "button", id: "search_account_btn", label: "🔍 Search Account", style: "primary", action: { type: "submit" } }
+    { type: "button", id: "search_account_btn", label: "🔍 Search Account", style: "secondary", action: { type: "submit" } }
   );
 
   if (options.accountList && options.accountList.length > 0) {
@@ -236,18 +260,17 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     });
   }
 
-  // Read-only Account Data Display (Retained Values)
+  // Read-only Account Data Display
   components.push(
     { type: "text", text: `*Account Status:* ${values.account_status || 'N/A'}`, style: "paragraph" },
     { type: "text", text: `*Partner Level:* ${values.partner_level || 'N/A'}`, style: "paragraph" },
     { type: "text", text: `*Website:* ${values.website || 'N/A'}`, style: "paragraph" },
     { type: "text", text: `*Dashboard URL:* ${values.dashboard_url || 'N/A'}`, style: "paragraph" },
-    { type: "text", text: `*Billing Address:* ${values.billing_address || 'N/A'}`, style: "paragraph" }
+    { type: "text", text: `*Billing Address:* ${values.billing_address || 'N/A'}`, style: "paragraph" },
+    { type: "divider" }
   );
 
-  components.push({ type: "divider" });
-
-  // 3. SOURCE DROPDOWN FIELD
+  // 4. SOURCE DROPDOWN FIELD
   components.push({
     type: "dropdown",
     id: "source",
@@ -265,7 +288,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     value: values.source || ""
   });
 
-  // 4. SUBMIT BUTTON
+  // 5. UPDATE TICKET SUBMIT BUTTON
   components.push({
     type: "button",
     id: "submit_case_manager",
@@ -286,7 +309,7 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
                    || req.body.custom_attributes?.salesforce_account_id
                    || req.body.customer?.custom_attributes?.salesforce_account_id;
 
-  let initialValues = {};
+  let initialValues = { sfCaseId };
 
   try {
     const conn = await getSalesforceConnection();
@@ -297,6 +320,16 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
         if (sfCase) {
           initialValues.source = sfCase.Source__c || "";
           initialValues.selected_contact_id = sfCase.ContactId || "";
+
+          if (sfCase.ContactId) {
+            const contactRec = await conn.sobject('Contact').retrieve(sfCase.ContactId);
+            if (contactRec) {
+              initialValues.contact_email = contactRec.Email || "N/A";
+              initialValues.contact_phone = contactRec.Phone || "N/A";
+              initialValues.contact_status = contactRec.Contact_Status__c || "N/A";
+              initialValues.contact_search_term = contactRec.Name || "";
+            }
+          }
         }
       } catch (caseErr) { console.error("Case Retrieve Error:", caseErr.message); }
     }
@@ -337,6 +370,8 @@ app.post('/intercom/account-app/submit', async (req, res) => {
                 || req.body.custom_attributes?.salesforce_id
                 || req.body.customer?.custom_attributes?.salesforce_id;
 
+  inputs.sfCaseId = sfCaseId;
+
   try {
     const conn = await getSalesforceConnection();
 
@@ -353,6 +388,8 @@ app.post('/intercom/account-app/submit', async (req, res) => {
 
         if (contactList.length > 0) {
           const matchedContact = contactList[0];
+          inputs.contact_email = matchedContact.Email || "N/A";
+          inputs.contact_phone = matchedContact.Phone || "N/A";
           inputs.contact_status = matchedContact.Contact_Status__c || "N/A";
 
           if (matchedContact.AccountId) {
@@ -418,7 +455,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       console.log(`Created New Case ${result.id}`);
     }
 
-    // Re-fetch Account details so that Account Status, Partner Level, etc. remain displayed
+    // Re-fetch Account details
     let updatedAccountList = [];
     if (inputs.selected_account_id) {
       try {
@@ -435,11 +472,13 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       } catch (fErr) { console.error(fErr.message); }
     }
 
-    // Re-fetch Contact status if contact is selected
+    // Re-fetch Contact details
     if (inputs.selected_contact_id) {
       try {
         const currentContact = await conn.sobject('Contact').retrieve(inputs.selected_contact_id);
         if (currentContact) {
+          inputs.contact_email = currentContact.Email || "N/A";
+          inputs.contact_phone = currentContact.Phone || "N/A";
           inputs.contact_status = currentContact.Contact_Status__c || "N/A";
         }
       } catch (cErr) { console.error(cErr.message); }
