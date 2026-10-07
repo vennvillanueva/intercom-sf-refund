@@ -783,6 +783,15 @@ async function loadIntercomAttrs(body) {
   }
 }
 
+// Topic values exactly as stored on the Intercom conversation attributes
+function intercomTopics(attrs) {
+  const g = name => {
+    const v = attrs && attrs[name];
+    return v === undefined || v === null ? "" : String(v);
+  };
+  return { primary: g(REASON_IC.primary), secondary: g(REASON_IC.secondary), tertiary: g(REASON_IC.tertiary) };
+}
+
 function findStage(attrs) {
   if (!attrs) return null;
   if (REASON_IC.stage && attrs[REASON_IC.stage] != null && attrs[REASON_IC.stage] !== '') return String(attrs[REASON_IC.stage]);
@@ -892,6 +901,14 @@ app.post('/intercom/case-reason-app/initialize', async (req, res) => {
       notice = "⚠️ No Salesforce ticket linked to this conversation";
     }
 
+    // Topics: use the Intercom conversation attribute values (Salesforce values only if Intercom has none)
+    const icT = intercomTopics(attrs);
+    if (icT.primary || icT.secondary || icT.tertiary) {
+      values.primary = icT.primary;
+      values.secondary = icT.secondary;
+      values.tertiary = icT.tertiary;
+    }
+
     // Salesforce has no notes yet but Intercom has a summary: prefill (agent clicks Save to sync)
     if (rec && !values.case_summary && attrs && attrs[REASON_IC.summary]) {
       values.case_summary = String(attrs[REASON_IC.summary]);
@@ -942,19 +959,30 @@ app.post('/intercom/case-reason-app/submit', async (req, res) => {
     const base = await fetchReasonCase(sfCaseId);
     if (!base) throw new Error("Salesforce ticket not found");
 
-    const cur = {
+    const sfCur = {
       primary: (REASON_SF.primary && base[REASON_SF.primary]) || "",
       secondary: (REASON_SF.secondary && base[REASON_SF.secondary]) || "",
       tertiary: (REASON_SF.tertiary && base[REASON_SF.tertiary]) || ""
     };
+
+    // Baseline for change detection = what Intercom currently has (fresh via API when a token
+    // is set), otherwise what Salesforce has.
+    let cur = sfCur;
+    if (process.env.INTERCOM_TOKEN) {
+      const icT = intercomTopics(await loadIntercomAttrs(req.body));
+      if (icT.primary || icT.secondary || icT.tertiary) cur = icT;
+    }
+
     // REFRESH: reload everything from Salesforce/Intercom and save nothing.
     // (Must run before the change detection below, which would treat the payload as new input.)
     if (clickedButton === "refresh_btn") {
-      values.primary = cur.primary;
-      values.secondary = cur.secondary;
-      values.tertiary = cur.tertiary;
-      values.case_summary = (REASON_SF.notes && base[REASON_SF.notes]) || "";
       const freshAttrs = await loadIntercomAttrs(req.body);
+      const icT = intercomTopics(freshAttrs);
+      const t = (icT.primary || icT.secondary || icT.tertiary) ? icT : sfCur;
+      values.primary = t.primary;
+      values.secondary = t.secondary;
+      values.tertiary = t.tertiary;
+      values.case_summary = (REASON_SF.notes && base[REASON_SF.notes]) || "";
       stage = findStage(freshAttrs);
       console.log('CASE REASON REFRESH stage =', stage);
       return res.json({
@@ -994,12 +1022,13 @@ app.post('/intercom/case-reason-app/submit', async (req, res) => {
         next.tertiary = cur.tertiary;
       }
 
-      ['primary', 'secondary', 'tertiary'].forEach(k => {
-        if (next[k] !== cur[k]) {
-          sfChanges[REASON_SF[k]] = next[k] || null;
-          icChanges[REASON_IC[k]] = next[k] || null;
-        }
-      });
+      const topicChanged = ['primary', 'secondary', 'tertiary'].some(k => next[k] !== cur[k]);
+      if (topicChanged) {
+        ['primary', 'secondary', 'tertiary'].forEach(k => {
+          sfChanges[REASON_SF[k]] = next[k] || null;     // keep all three levels in sync in Salesforce
+          if (next[k] !== cur[k]) icChanges[REASON_IC[k]] = next[k] || null;
+        });
+      }
     } else {
       // Show what is on the Case, change nothing
       next.primary = cur.primary;
@@ -1034,7 +1063,7 @@ app.post('/intercom/case-reason-app/submit', async (req, res) => {
 
       let icNote = "";
       if (convId && Object.keys(icChanges).length > 0 && !process.env.INTERCOM_TOKEN) {
-        icNote = " ℹ️ Intercom attributes were not updated (INTERCOM_TOKEN is not set)";
+        icNote = " ⚠️ Intercom was NOT updated because INTERCOM_TOKEN is not set in Render, so the Intercom fields will still show the old values";
       } else if (convId && Object.keys(icChanges).length > 0) {
         try {
           await intercomRequest('PUT', `/conversations/${convId}`, { custom_attributes: icChanges });
