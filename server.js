@@ -73,6 +73,25 @@ function safeParseFloat(val) {
   return isNaN(parsed) ? null : parsed;
 }
 
+// Helper: Safely query base Case fields without throwing on missing permission
+async function fetchCaseDetailsSafely(sfCaseId) {
+  const conn = await getSalesforceConnection();
+  let caseData = {};
+
+  try {
+    const query = `SELECT Id, Source__c, ContactId, AccountId, Order_ID__c, Date_of_Order__c, Guest_Name__c, Order_Type__c, Delivery_Order_ID__c, Delivery_Partner__c, Dispute_ID__c, Amount_Issued_to_Customer_Account__c, Amount_Issued_to_Guest__c, Refund_Reason_Notes__c, Third_Party_Reimbursement_Amount__c, Third_Party_Reimbursement_Status__c, Stripe_Reimbursement_Link__c, Refund_Complete__c FROM Case WHERE Id = '${sfCaseId}' LIMIT 1`;
+    const res = await conn.query(query);
+    if (res.records && res.records.length > 0) {
+      caseData = res.records[0];
+    }
+  } catch (e) {
+    console.error("Safe Case Query Error, using retrieve fallback:", e.message);
+    caseData = await conn.sobject('Case').retrieve(sfCaseId).catch(() => ({})) || {};
+  }
+
+  return caseData;
+}
+
 // ==========================================
 // APP 1: REFUND DETAILS APP
 // ==========================================
@@ -151,21 +170,15 @@ function buildRefundForm(values = {}, message = null) {
   return components;
 }
 
-// INITIALIZE REFUND APP (Bulletproof Field-by-Field Fetching)
+// INITIALIZE REFUND APP
 app.post('/intercom/initialize', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
   let existingValues = {};
 
   if (sfCaseId) {
     try {
-      const conn = await getSalesforceConnection();
-      
-      // Step 1: Query base Refund fields directly from Case object
-      const query = `SELECT Order_ID__c, Date_of_Order__c, Guest_Name__c, Order_Type__c, Delivery_Order_ID__c, Delivery_Partner__c, Dispute_ID__c, Amount_Issued_to_Customer_Account__c, Amount_Issued_to_Guest__c, Refund_Reason_Notes__c, Third_Party_Reimbursement_Amount__c, Third_Party_Reimbursement_Status__c, Stripe_Reimbursement_Link__c, Refund_Complete__c FROM Case WHERE Id = '${sfCaseId}' LIMIT 1`;
-      const result = await conn.query(query).catch(() => null);
-
-      if (result && result.records && result.records.length > 0) {
-        const sfRecord = result.records[0];
+      const sfRecord = await fetchCaseDetailsSafely(sfCaseId);
+      if (sfRecord && sfRecord.Id) {
         existingValues = {
           order_id: sfRecord.Order_ID__c || "",
           date_of_order: sfRecord.Date_of_Order__c || "",
@@ -182,27 +195,6 @@ app.post('/intercom/initialize', async (req, res) => {
           stripe_reimbursement_link: sfRecord.Stripe_Reimbursement_Link__c || "",
           refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
         };
-      } else {
-        // Step 2: Fallback retrieve if SOQL query gets restricted by permission set
-        const sfRecord = await conn.sobject('Case').retrieve(sfCaseId).catch(() => null);
-        if (sfRecord) {
-          existingValues = {
-            order_id: sfRecord.Order_ID__c || "",
-            date_of_order: sfRecord.Date_of_Order__c || "",
-            guest_name: sfRecord.Guest_Name__c || "",
-            order_type: sfRecord.Order_Type__c || "Delivery",
-            delivery_order_id: sfRecord.Delivery_Order_ID__c || "",
-            delivery_partner: sfRecord.Delivery_Partner__c || "",
-            dispute_id: sfRecord.Dispute_ID__c || "",
-            amount_issued_account: sfRecord.Amount_Issued_to_Customer_Account__c != null ? String(sfRecord.Amount_Issued_to_Customer_Account__c) : "",
-            amount_issued_guest: sfRecord.Amount_Issued_to_Guest__c != null ? String(sfRecord.Amount_Issued_to_Guest__c) : "",
-            refund_reason_notes: sfRecord.Refund_Reason_Notes__c || "",
-            third_party_reimbursement_amount: sfRecord.Third_Party_Reimbursement_Amount__c != null ? String(sfRecord.Third_Party_Reimbursement_Amount__c) : "",
-            third_party_reimbursement_status: sfRecord.Third_Party_Reimbursement_Status__c || "",
-            stripe_reimbursement_link: sfRecord.Stripe_Reimbursement_Link__c || "",
-            refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
-          };
-        }
       }
     } catch (err) { 
       console.error("Refund App Initialize Error:", err.message); 
@@ -393,9 +385,9 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
   if (sfCaseId) {
     try {
       const conn = await getSalesforceConnection();
-      const sfCase = await conn.sobject('Case').retrieve(sfCaseId).catch(() => null);
+      const sfCase = await fetchCaseDetailsSafely(sfCaseId);
 
-      if (sfCase) {
+      if (sfCase && sfCase.Id) {
         initialValues.source = sfCase.Source__c || "";
 
         if (sfCase.ContactId) {
