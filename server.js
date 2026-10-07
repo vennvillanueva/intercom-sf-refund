@@ -41,7 +41,7 @@ function formatAddress(addr) {
   return parts.length > 0 ? parts.join(', ') : "N/A";
 }
 
-// Helper: Extract Salesforce Case ID across all possible Intercom payload paths
+// Robust extractor for Salesforce Case ID across all possible Intercom payload paths
 function extractSfCaseId(body) {
   return body.conversation?.custom_attributes?.salesforce_id
       || body.conversation?.custom_attributes?.salesforce_case_id
@@ -55,7 +55,7 @@ function extractSfCaseId(body) {
 }
 
 // ==========================================
-// APP 1: REFUND APP (Form & Endpoints)
+// APP 1: REFUND DETAILS APP
 // ==========================================
 function buildRefundForm(values = {}) {
   return [
@@ -120,7 +120,7 @@ function buildRefundForm(values = {}) {
   ];
 }
 
-// INITIALIZE REFUND APP (Using direct SOQL Query for reliability)
+// INITIALIZE REFUND APP (Hard Refresh Safe)
 app.post('/intercom/initialize', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
   let existingValues = {};
@@ -128,29 +128,51 @@ app.post('/intercom/initialize', async (req, res) => {
   if (sfCaseId) {
     try {
       const conn = await getSalesforceConnection();
-      const query = `SELECT Order_ID__c, Date_of_Order__c, Guest_Name__c, Order_Type__c, Delivery_Order_ID__c, Delivery_Partner__c, Dispute_ID__c, Amount_Issued_to_Customer_Account__c, Amount_Issued_to_Guest__c, Refund_Reason_Notes__c, Third_Party_Reimbursement_Amount__c, Third_Party_Reimbursement_Status__c, Stripe_Reimbursement_Link__c, Refund_Complete__c FROM Case WHERE Id = '${sfCaseId}' LIMIT 1`;
-      const result = await conn.query(query);
-
-      if (result.records && result.records.length > 0) {
-        const sfRecord = result.records[0];
-        existingValues = {
-          order_id: sfRecord.Order_ID__c || "",
-          date_of_order: sfRecord.Date_of_Order__c || "",
-          guest_name: sfRecord.Guest_Name__c || "",
-          order_type: sfRecord.Order_Type__c || "Delivery",
-          delivery_order_id: sfRecord.Delivery_Order_ID__c || "",
-          delivery_partner: sfRecord.Delivery_Partner__c || "",
-          dispute_id: sfRecord.Dispute_ID__c || "",
-          amount_issued_account: sfRecord.Amount_Issued_to_Customer_Account__c != null ? String(sfRecord.Amount_Issued_to_Customer_Account__c) : "",
-          amount_issued_guest: sfRecord.Amount_Issued_to_Guest__c != null ? String(sfRecord.Amount_Issued_to_Guest__c) : "",
-          refund_reason_notes: sfRecord.Refund_Reason_Notes__c || "",
-          third_party_reimbursement_amount: sfRecord.Third_Party_Reimbursement_Amount__c != null ? String(sfRecord.Third_Party_Reimbursement_Amount__c) : "",
-          third_party_reimbursement_status: sfRecord.Third_Party_Reimbursement_Status__c || "",
-          stripe_reimbursement_link: sfRecord.Stripe_Reimbursement_Link__c || "",
-          refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
-        };
+      try {
+        const query = `SELECT Order_ID__c, Date_of_Order__c, Guest_Name__c, Order_Type__c, Delivery_Order_ID__c, Delivery_Partner__c, Dispute_ID__c, Amount_Issued_to_Customer_Account__c, Amount_Issued_to_Guest__c, Refund_Reason_Notes__c, Third_Party_Reimbursement_Amount__c, Third_Party_Reimbursement_Status__c, Stripe_Reimbursement_Link__c, Refund_Complete__c FROM Case WHERE Id = '${sfCaseId}' LIMIT 1`;
+        const result = await conn.query(query);
+        if (result.records && result.records.length > 0) {
+          const sfRecord = result.records[0];
+          existingValues = {
+            order_id: sfRecord.Order_ID__c || "",
+            date_of_order: sfRecord.Date_of_Order__c || "",
+            guest_name: sfRecord.Guest_Name__c || "",
+            order_type: sfRecord.Order_Type__c || "Delivery",
+            delivery_order_id: sfRecord.Delivery_Order_ID__c || "",
+            delivery_partner: sfRecord.Delivery_Partner__c || "",
+            dispute_id: sfRecord.Dispute_ID__c || "",
+            amount_issued_account: sfRecord.Amount_Issued_to_Customer_Account__c != null ? String(sfRecord.Amount_Issued_to_Customer_Account__c) : "",
+            amount_issued_guest: sfRecord.Amount_Issued_to_Guest__c != null ? String(sfRecord.Amount_Issued_to_Guest__c) : "",
+            refund_reason_notes: sfRecord.Refund_Reason_Notes__c || "",
+            third_party_reimbursement_amount: sfRecord.Third_Party_Reimbursement_Amount__c != null ? String(sfRecord.Third_Party_Reimbursement_Amount__c) : "",
+            third_party_reimbursement_status: sfRecord.Third_Party_Reimbursement_Status__c || "",
+            stripe_reimbursement_link: sfRecord.Stripe_Reimbursement_Link__c || "",
+            refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
+          };
+        }
+      } catch (queryErr) {
+        console.error("Refund App SOQL Query Fallback:", queryErr.message);
+        const sfRecord = await conn.sobject('Case').retrieve(sfCaseId);
+        if (sfRecord) {
+          existingValues = {
+            order_id: sfRecord.Order_ID__c || "",
+            date_of_order: sfRecord.Date_of_Order__c || "",
+            guest_name: sfRecord.Guest_Name__c || "",
+            order_type: sfRecord.Order_Type__c || "Delivery",
+            delivery_order_id: sfRecord.Delivery_Order_ID__c || "",
+            delivery_partner: sfRecord.Delivery_Partner__c || "",
+            dispute_id: sfRecord.Dispute_ID__c || "",
+            amount_issued_account: sfRecord.Amount_Issued_to_Customer_Account__c ? String(sfRecord.Amount_Issued_to_Customer_Account__c) : "",
+            amount_issued_guest: sfRecord.Amount_Issued_to_Guest__c ? String(sfRecord.Amount_Issued_to_Guest__c) : "",
+            refund_reason_notes: sfRecord.Refund_Reason_Notes__c || "",
+            third_party_reimbursement_amount: sfRecord.Third_Party_Reimbursement_Amount__c ? String(sfRecord.Third_Party_Reimbursement_Amount__c) : "",
+            third_party_reimbursement_status: sfRecord.Third_Party_Reimbursement_Status__c || "",
+            stripe_reimbursement_link: sfRecord.Stripe_Reimbursement_Link__c || "",
+            refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
+          };
+        }
       }
-    } catch (err) { console.error("Refund App Direct SOQL Initialize Error:", err.message); }
+    } catch (err) { console.error("Refund App Initialize Error:", err.message); }
   }
 
   res.json({ canvas: { content: { components: buildRefundForm(existingValues) } } });
@@ -196,7 +218,7 @@ app.post('/intercom/submit', async (req, res) => {
 
 
 // ==========================================
-// APP 2: SALESFORCE CASE MANAGER
+// APP 2: SALESFORCE CASE MANAGER APP
 // ==========================================
 function buildAccountContactUI(values = {}, options = {}, message = null) {
   const components = [];
@@ -308,7 +330,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
   return components;
 }
 
-// INITIALIZE CASE MANAGER APP
+// INITIALIZE CASE MANAGER APP (Hard Refresh Safe)
 app.post('/intercom/account-app/initialize', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
 
