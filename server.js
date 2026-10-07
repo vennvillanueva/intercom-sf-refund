@@ -159,11 +159,9 @@ app.post('/intercom/initialize', async (req, res) => {
   if (sfCaseId) {
     try {
       const conn = await getSalesforceConnection();
-      const query = `SELECT Order_ID__c, Date_of_Order__c, Guest_Name__c, Order_Type__c, Delivery_Order_ID__c, Delivery_Partner__c, Dispute_ID__c, Amount_Issued_to_Customer_Account__c, Amount_Issued_to_Guest__c, Refund_Reason_Notes__c, Third_Party_Reimbursement_Amount__c, Third_Party_Reimbursement_Status__c, Stripe_Reimbursement_Link__c, Refund_Complete__c FROM Case WHERE Id = '${sfCaseId}' LIMIT 1`;
-      const result = await conn.query(query);
+      const sfRecord = await conn.sobject('Case').retrieve(sfCaseId).catch(() => null);
 
-      if (result.records && result.records.length > 0) {
-        const sfRecord = result.records[0];
+      if (sfRecord) {
         existingValues = {
           order_id: sfRecord.Order_ID__c || "",
           date_of_order: sfRecord.Date_of_Order__c || "",
@@ -359,7 +357,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
   return components;
 }
 
-// INITIALIZE CASE MANAGER APP
+// INITIALIZE CASE MANAGER APP (Isolated Safe Retrievals)
 app.post('/intercom/account-app/initialize', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
 
@@ -370,35 +368,39 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
   if (sfCaseId) {
     try {
       const conn = await getSalesforceConnection();
-      const query = `SELECT Id, Source__c, ContactId, Contact.Name, Contact.Email, Contact.Phone, Contact.Contact_Status__c, AccountId, Account.Name, Account.Account_Status__c, Account.Partner_Level__c, Account.Website, Account.Dashboard_URL__c, Account.BillingAddress FROM Case WHERE Id = '${sfCaseId}' LIMIT 1`;
-      const result = await conn.query(query);
+      const sfCase = await conn.sobject('Case').retrieve(sfCaseId).catch(() => null);
 
-      if (result.records && result.records.length > 0) {
-        const sfCase = result.records[0];
+      if (sfCase) {
         initialValues.source = sfCase.Source__c || "";
 
-        if (sfCase.Contact) {
-          initialValues.selected_contact_id = sfCase.ContactId || "";
-          initialValues.contact_search_term = sfCase.Contact.Name || "";
-          initialValues.contact_email = sfCase.Contact.Email || "N/A";
-          initialValues.contact_phone = sfCase.Contact.Phone || "N/A";
-          initialValues.contact_status = sfCase.Contact.Contact_Status__c || "N/A";
-          contactList = [{ Id: sfCase.ContactId, Name: sfCase.Contact.Name, Email: sfCase.Contact.Email, Phone: sfCase.Contact.Phone }];
+        if (sfCase.ContactId) {
+          initialValues.selected_contact_id = sfCase.ContactId;
+          const contactRecord = await conn.sobject('Contact').retrieve(sfCase.ContactId).catch(() => null);
+          if (contactRecord) {
+            initialValues.contact_search_term = contactRecord.Name || "";
+            initialValues.contact_email = contactRecord.Email || "N/A";
+            initialValues.contact_phone = contactRecord.Phone || "N/A";
+            initialValues.contact_status = contactRecord.Contact_Status__c || "N/A";
+            contactList = [contactRecord];
+          }
         }
 
-        if (sfCase.Account) {
-          initialValues.selected_account_id = sfCase.AccountId || "";
-          initialValues.account_search_term = sfCase.Account.Name || "";
-          initialValues.account_status = sfCase.Account.Account_Status__c || "N/A";
-          initialValues.partner_level = sfCase.Account.Partner_Level__c || "N/A";
-          initialValues.website = sfCase.Account.Website || "N/A";
-          initialValues.dashboard_url = sfCase.Account.Dashboard_URL__c || "N/A";
-          initialValues.billing_address = formatAddress(sfCase.Account.BillingAddress);
-          accountList = [{ Id: sfCase.AccountId, Name: sfCase.Account.Name }];
+        if (sfCase.AccountId) {
+          initialValues.selected_account_id = sfCase.AccountId;
+          const accountRecord = await conn.sobject('Account').retrieve(sfCase.AccountId).catch(() => null);
+          if (accountRecord) {
+            initialValues.account_search_term = accountRecord.Name || "";
+            initialValues.account_status = accountRecord.Account_Status__c || "N/A";
+            initialValues.partner_level = accountRecord.Partner_Level__c || "N/A";
+            initialValues.website = accountRecord.Website || "N/A";
+            initialValues.dashboard_url = accountRecord.Dashboard_URL__c || "N/A";
+            initialValues.billing_address = formatAddress(accountRecord.BillingAddress);
+            accountList = [accountRecord];
+          }
         }
       }
     } catch (err) { 
-      console.error("Case Manager Direct Query Initialize Error:", err.message);
+      console.error("Case Manager Initialize Error:", err.message);
       sfConn = null;
     }
   }
@@ -430,7 +432,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       const searchTerm = (inputs.contact_search_term || "").trim();
       if (searchTerm) {
         const query = `SELECT Id, Name, Email, Phone, Contact_Status__c, AccountId FROM Contact WHERE Name LIKE '%${searchTerm}%' OR Email LIKE '%${searchTerm}%' OR Phone LIKE '%${searchTerm}%' LIMIT 10`;
-        const result = await conn.query(query);
+        const result = await conn.query(query).catch(() => ({ records: [] }));
         contactList = result.records || [];
         if (contactList.length > 0) {
           inputs.selected_contact_id = contactList[0].Id;
@@ -443,7 +445,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       const searchTerm = (inputs.account_search_term || "").trim();
       if (searchTerm) {
         const query = `SELECT Id, Name, Account_Status__c, Partner_Level__c, Website, Dashboard_URL__c, BillingAddress FROM Account WHERE Name LIKE '%${searchTerm}%' LIMIT 10`;
-        const result = await conn.query(query);
+        const result = await conn.query(query).catch(() => ({ records: [] }));
         accountList = result.records || [];
         if (accountList.length > 0) {
           inputs.selected_account_id = accountList[0].Id;
