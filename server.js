@@ -305,7 +305,7 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
       const sfCase = await conn.sobject('Case').retrieve(sfCaseId);
 
       if (sfCase) {
-        initialValues.source = sfCase.Source__c || sfCase.Origin || "";
+        initialValues.source = sfCase.Source__c || "";
         initialValues.selected_contact_id = sfCase.ContactId || "";
         initialValues.selected_account_id = sfCase.AccountId || "";
 
@@ -367,7 +367,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
 
   inputs.sfCaseId = sfCaseId;
 
-  let updateNotice = "✅ Salesforce ticket updated";
+  let updateNotice = null;
 
   try {
     const conn = await getSalesforceConnection();
@@ -435,17 +435,17 @@ app.post('/intercom/account-app/submit', async (req, res) => {
     }
 
     // Determine Specific Update Notice Banner
-    if (clickedButton === "source" || inputs.source) {
+    if (clickedButton === "source") {
       updateNotice = "✅ Source set to Salesforce ticket";
-    }
-    if (clickedButton === "selected_contact_id" || clickedButton === "search_contact_btn") {
+    } else if (clickedButton === "selected_contact_id" || clickedButton === "search_contact_btn") {
       updateNotice = "✅ Contact updated to Salesforce ticket";
-    }
-    if (clickedButton === "selected_account_id" || clickedButton === "search_account_btn") {
+    } else if (clickedButton === "selected_account_id" || clickedButton === "search_account_btn") {
       updateNotice = "✅ Account updated to Salesforce ticket";
+    } else if (inputs.source || inputs.selected_contact_id || inputs.selected_account_id) {
+      updateNotice = "✅ Salesforce ticket updated";
     }
 
-    // UPDATE BOTH Source__c & Origin TO GUARANTEE INSTANT SYNC IN SALESFORCE
+    // SAFE UPDATE DIRECTLY TO Source__c
     if (sfCaseId) {
       const sfData = {
         Id: sfCaseId,
@@ -453,18 +453,12 @@ app.post('/intercom/account-app/submit', async (req, res) => {
         AccountId: inputs.selected_account_id || null
       };
 
-      if (inputs.source) {
+      if (inputs.source !== undefined) {
         sfData.Source__c = inputs.source;
-        sfData.Origin = inputs.source;
       }
 
-      try {
-        await conn.sobject('Case').update(sfData);
-        console.log(`Auto-synced Case ${sfCaseId} with Source: ${inputs.source}`);
-      } catch (updErr) {
-        delete sfData.Origin;
-        await conn.sobject('Case').update(sfData);
-      }
+      await conn.sobject('Case').update(sfData);
+      console.log(`Auto-synced Case ${sfCaseId} with Source: ${inputs.source}`);
     }
 
     res.json({
