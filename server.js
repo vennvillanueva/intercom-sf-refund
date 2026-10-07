@@ -73,19 +73,20 @@ function safeParseFloat(val) {
   return isNaN(parsed) ? null : parsed;
 }
 
-// Helper: Safely query base Case fields without throwing on missing permission
+// BULLETPROOF CASE FETCH: Returns safe nulls for missing or invalid columns
 async function fetchCaseDetailsSafely(sfCaseId) {
   const conn = await getSalesforceConnection();
   let caseData = {};
 
   try {
-    const query = `SELECT Id, Source__c, ContactId, AccountId, Order_ID__c, Date_of_Order__c, Guest_Name__c, Order_Type__c, Delivery_Order_ID__c, Delivery_Partner__c, Dispute_ID__c, Amount_Issued_to_Customer_Account__c, Amount_Issued_to_Guest__c, Refund_Reason_Notes__c, Third_Party_Reimbursement_Amount__c, Third_Party_Reimbursement_Status__c, Stripe_Reimbursement_Link__c, Refund_Complete__c FROM Case WHERE Id = '${sfCaseId}' LIMIT 1`;
+    // Excluded non-existent Third_Party_Reimbursement_Amount__c to guarantee SOQL success
+    const query = `SELECT Id, Source__c, ContactId, AccountId, Order_ID__c, Date_of_Order__c, Guest_Name__c, Order_Type__c, Delivery_Order_ID__c, Delivery_Partner__c, Dispute_ID__c, Amount_Issued_to_Customer_Account__c, Amount_Issued_to_Guest__c, Refund_Reason_Notes__c, Third_Party_Reimbursement_Status__c, Stripe_Reimbursement_Link__c, Refund_Complete__c FROM Case WHERE Id = '${sfCaseId}' LIMIT 1`;
     const res = await conn.query(query);
     if (res.records && res.records.length > 0) {
       caseData = res.records[0];
     }
   } catch (e) {
-    console.error("Safe Case Query Error, using retrieve fallback:", e.message);
+    console.error("Safe Case Query Fallback activated:", e.message);
     caseData = await conn.sobject('Case').retrieve(sfCaseId).catch(() => ({})) || {};
   }
 
@@ -190,7 +191,7 @@ app.post('/intercom/initialize', async (req, res) => {
           amount_issued_account: sfRecord.Amount_Issued_to_Customer_Account__c != null ? String(sfRecord.Amount_Issued_to_Customer_Account__c) : "",
           amount_issued_guest: sfRecord.Amount_Issued_to_Guest__c != null ? String(sfRecord.Amount_Issued_to_Guest__c) : "",
           refund_reason_notes: sfRecord.Refund_Reason_Notes__c || "",
-          third_party_reimbursement_amount: sfRecord.Third_Party_Reimbursement_Amount__c != null ? String(sfRecord.Third_Party_Reimbursement_Amount__c) : "",
+          third_party_reimbursement_amount: "",
           third_party_reimbursement_status: sfRecord.Third_Party_Reimbursement_Status__c || "",
           stripe_reimbursement_link: sfRecord.Stripe_Reimbursement_Link__c || "",
           refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
@@ -223,7 +224,6 @@ app.post('/intercom/submit', async (req, res) => {
       Amount_Issued_to_Customer_Account__c: safeParseFloat(inputs.amount_issued_account),
       Amount_Issued_to_Guest__c: safeParseFloat(inputs.amount_issued_guest),
       Refund_Reason_Notes__c: inputs.refund_reason_notes || null,
-      Third_Party_Reimbursement_Amount__c: safeParseFloat(inputs.third_party_reimbursement_amount),
       Third_Party_Reimbursement_Status__c: inputs.third_party_reimbursement_status || null,
       Stripe_Reimbursement_Link__c: inputs.stripe_reimbursement_link || null,
       Refund_Complete__c: inputs.refund_complete === "Yes"
