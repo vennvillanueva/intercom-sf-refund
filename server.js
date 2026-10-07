@@ -191,7 +191,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     });
   }
 
-  // 1. GO TO SALESFORCE TICKET BUTTON (Pinakataas na bahagi)
+  // 1. GO TO SALESFORCE TICKET BUTTON
   if (values.sfCaseId) {
     const sfDomain = process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com';
     const caseUrl = `${sfDomain}/${values.sfCaseId}`;
@@ -210,7 +210,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     );
   }
 
-  // 2. CONTACT SEARCH BLOCK (Secondary / Gray Style Search Button)
+  // 2. CONTACT SEARCH BLOCK
   components.push(
     { type: "input", id: "contact_search_term", label: "Search Contact", value: values.contact_search_term || "", placeholder: "Name, email, or phone..." },
     { type: "button", id: "search_contact_btn", label: "🔍 Search Contact", style: "secondary", action: { type: "submit" } }
@@ -231,7 +231,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     });
   }
 
-  // Contact Details Display: Email, Phone, & Status
+  // Contact Details Display
   components.push(
     { type: "text", text: `*Contact Email:* ${values.contact_email || 'N/A'}`, style: "paragraph" },
     { type: "text", text: `*Contact Phone:* ${values.contact_phone || 'N/A'}`, style: "paragraph" },
@@ -239,7 +239,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     { type: "divider" }
   );
 
-  // 3. ACCOUNT SEARCH & DROPDOWN BLOCK (Secondary / Gray Style Search Button)
+  // 3. ACCOUNT SEARCH BLOCK
   components.push(
     { type: "input", id: "account_search_term", label: "Search Account", value: values.account_search_term || "", placeholder: "Type account name..." },
     { type: "button", id: "search_account_btn", label: "🔍 Search Account", style: "secondary", action: { type: "submit" } }
@@ -375,45 +375,58 @@ app.post('/intercom/account-app/submit', async (req, res) => {
   try {
     const conn = await getSalesforceConnection();
 
-    // 1. SEARCH CONTACT
-    if (clickedButton === "search_contact_btn") {
-      const searchTerm = (inputs.contact_search_term || "").trim();
+    // DYNAMIC CONTACT SELECTION & ACCOUNT AUTO-FETCH
+    // Kapag nag-click ng Contact search O namili ng Contact sa dropdown:
+    if (clickedButton === "search_contact_btn" || inputs.selected_contact_id) {
+      // Kung bagong search term, kunin ang list ng contacts
       let contactList = [];
       let accountList = [];
 
-      if (searchTerm) {
-        const query = `SELECT Id, Name, Email, Phone, Contact_Status__c, AccountId FROM Contact WHERE Name LIKE '%${searchTerm}%' OR Email LIKE '%${searchTerm}%' OR Phone LIKE '%${searchTerm}%' LIMIT 10`;
-        const result = await conn.query(query);
-        contactList = result.records || [];
-
-        if (contactList.length > 0) {
-          const matchedContact = contactList[0];
-          inputs.contact_email = matchedContact.Email || "N/A";
-          inputs.contact_phone = matchedContact.Phone || "N/A";
-          inputs.contact_status = matchedContact.Contact_Status__c || "N/A";
-
-          if (matchedContact.AccountId) {
-            try {
-              const accRecord = await conn.sobject('Account').retrieve(matchedContact.AccountId);
-              if (accRecord) {
-                accountList = [accRecord];
-                inputs.selected_account_id = accRecord.Id;
-                inputs.account_search_term = accRecord.Name;
-                inputs.account_status = accRecord.Account_Status__c || "N/A";
-                inputs.partner_level = accRecord.Partner_Level__c || "N/A";
-                inputs.website = accRecord.Website || "N/A";
-                inputs.dashboard_url = accRecord.Dashboard_URL__c || "N/A";
-                inputs.billing_address = formatAddress(accRecord.BillingAddress);
-              }
-            } catch (aErr) { console.error("Contact Account Fetch Error:", aErr.message); }
+      if (clickedButton === "search_contact_btn") {
+        const searchTerm = (inputs.contact_search_term || "").trim();
+        if (searchTerm) {
+          const query = `SELECT Id, Name, Email, Phone, Contact_Status__c, AccountId FROM Contact WHERE Name LIKE '%${searchTerm}%' OR Email LIKE '%${searchTerm}%' OR Phone LIKE '%${searchTerm}%' LIMIT 10`;
+          const result = await conn.query(query);
+          contactList = result.records || [];
+          if (contactList.length > 0) {
+            inputs.selected_contact_id = contactList[0].Id;
           }
         }
       }
 
-      return res.json({ canvas: { content: { components: buildAccountContactUI(inputs, { contactList, accountList }) } } });
+      // Dynamic fetch para sa partikular na Contact ID na NAPILI sa dropdown
+      if (inputs.selected_contact_id) {
+        try {
+          const targetContact = await conn.sobject('Contact').retrieve(inputs.selected_contact_id);
+          if (targetContact) {
+            inputs.contact_email = targetContact.Email || "N/A";
+            inputs.contact_phone = targetContact.Phone || "N/A";
+            inputs.contact_status = targetContact.Contact_Status__c || "N/A";
+
+            // KUSA AT DYNAMIC NA PAPALITAN ANG ACCOUNT BASE SA NAPILING CONTACT!
+            if (targetContact.AccountId) {
+              const targetAcc = await conn.sobject('Account').retrieve(targetContact.AccountId);
+              if (targetAcc) {
+                accountList = [targetAcc];
+                inputs.selected_account_id = targetAcc.Id;
+                inputs.account_search_term = targetAcc.Name;
+                inputs.account_status = targetAcc.Account_Status__c || "N/A";
+                inputs.partner_level = targetAcc.Partner_Level__c || "N/A";
+                inputs.website = targetAcc.Website || "N/A";
+                inputs.dashboard_url = targetAcc.Dashboard_URL__c || "N/A";
+                inputs.billing_address = formatAddress(targetAcc.BillingAddress);
+              }
+            }
+          }
+        } catch (cErr) { console.error("Contact Auto Fetch Error:", cErr.message); }
+      }
+
+      if (clickedButton === "search_contact_btn") {
+        return res.json({ canvas: { content: { components: buildAccountContactUI(inputs, { contactList, accountList }) } } });
+      }
     }
 
-    // 2. SEARCH ACCOUNT
+    // 2. SEARCH ACCOUNT (Manual Search fallback option)
     if (clickedButton === "search_account_btn") {
       const searchTerm = (inputs.account_search_term || "").trim();
       let accountList = [];
@@ -423,6 +436,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
         accountList = result.records || [];
         if (accountList.length > 0) {
           const topAcc = accountList[0];
+          inputs.selected_account_id = topAcc.Id;
           inputs.account_status = topAcc.Account_Status__c || "N/A";
           inputs.partner_level = topAcc.Partner_Level__c || "N/A";
           inputs.website = topAcc.Website || "N/A";
@@ -433,7 +447,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       return res.json({ canvas: { content: { components: buildAccountContactUI(inputs, { accountList }) } } });
     }
 
-    // 3. UPDATE SALESFORCE CASE TICKET & RETAIN DISPLAY VALUES
+    // 3. UPDATE SALESFORCE CASE TICKET
     const sfData = {
       Source__c: inputs.source || null
     };
@@ -455,7 +469,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       console.log(`Created New Case ${result.id}`);
     }
 
-    // Re-fetch Account details
+    // Maintain displayed Account & Contact info upon submit
     let updatedAccountList = [];
     if (inputs.selected_account_id) {
       try {
@@ -470,18 +484,6 @@ app.post('/intercom/account-app/submit', async (req, res) => {
           inputs.billing_address = formatAddress(currentAcc.BillingAddress);
         }
       } catch (fErr) { console.error(fErr.message); }
-    }
-
-    // Re-fetch Contact details
-    if (inputs.selected_contact_id) {
-      try {
-        const currentContact = await conn.sobject('Contact').retrieve(inputs.selected_contact_id);
-        if (currentContact) {
-          inputs.contact_email = currentContact.Email || "N/A";
-          inputs.contact_phone = currentContact.Phone || "N/A";
-          inputs.contact_status = currentContact.Contact_Status__c || "N/A";
-        }
-      } catch (cErr) { console.error(cErr.message); }
     }
 
     res.json({
@@ -507,3 +509,4 @@ app.post('/intercom/account-app/submit', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
