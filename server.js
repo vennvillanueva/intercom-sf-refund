@@ -691,19 +691,55 @@ app.post('/intercom/account-app/submit', async (req, res) => {
 // Primary / Secondary / Tertiary reason (dependent picklists) + Case Summary
 // ==========================================
 const REASON_SF = {
-  primary: 'Case_Reason__c',
+  primary: 'Reason', // standard Case field (resolved/verified at runtime)
   secondary: 'Case_Secondary_Reason__c',
   tertiary: 'Case_Tertiary_Reason__c',
   notes: 'Case_Closed_Notes__c'
 };
+
+// Resolve the real API names on Case (the primary field's name differs from what we assumed).
+// The primary field is also discoverable as the controlling field of the secondary picklist.
+async function loadReasonMeta() {
+  const meta = await loadCaseFieldMeta();
+  if (meta.reasonResolved) return meta;
+
+  const find = names => {
+    for (const n of names) {
+      const f = meta.byLower.get(n.toLowerCase());
+      if (f) return f.name;
+    }
+    return null;
+  };
+
+  const secondary = find(['Case_Secondary_Reason__c']);
+  const tertiary = find(['Case_Tertiary_Reason__c']);
+  const notes = find(['Case_Closed_Notes__c']);
+  let primary = find(['Reason', 'Case_Reason__c', 'Case_Primary_Reason__c', 'Primary_Reason__c']); // 'Reason' is the standard Case field
+  if (!primary && secondary) {
+    const ctrl = meta.byLower.get(secondary.toLowerCase()).controllerName;
+    if (ctrl && meta.byLower.has(ctrl.toLowerCase())) primary = meta.byLower.get(ctrl.toLowerCase()).name;
+  }
+
+  REASON_SF.primary = primary;
+  REASON_SF.secondary = secondary;
+  REASON_SF.tertiary = tertiary;
+  REASON_SF.notes = notes;
+
+  const reasonFields = [...meta.byLower.values()].filter(f => /reason|closed_notes/i.test(f.name)).map(f => f.name);
+  console.log('Case fields matching "reason": ', reasonFields.join(', ') || '(none)');
+  console.log('Resolved reason fields:', JSON.stringify(REASON_SF));
+
+  meta.reasonResolved = true;
+  return meta;
+}
 
 // Intercom conversation attribute names (override with env vars if they differ)
 const REASON_IC = {
   primary: process.env.IC_ATTR_PRIMARY || 'Primary Topic',
   secondary: process.env.IC_ATTR_SECONDARY || 'Secondary Topic',
   tertiary: process.env.IC_ATTR_TERTIARY || 'Tertiary Topic',
-  summary: process.env.IC_ATTR_SUMMARY || 'Case summary',
-  stage: process.env.IC_ATTR_STAGE || null // optional exact name of the Conversation Stage attribute
+  summary: process.env.IC_ATTR_SUMMARY || 'Conversation Summary',
+  stage: process.env.IC_ATTR_STAGE || 'Intercom Conversation Stage'
 };
 
 // ---- Intercom API helpers ----
@@ -757,6 +793,7 @@ function isValidFor(buf, idx) {
 
 // Options of a picklist field, filtered by the controlling field's selected value
 function picklistOptions(meta, fieldName, controllerValue) {
+  if (!fieldName) return [];
   const f = meta.byLower.get(fieldName.toLowerCase());
   if (!f) return [];
   const active = (f.picklistValues || []).filter(v => v.active);
@@ -772,12 +809,11 @@ function picklistOptions(meta, fieldName, controllerValue) {
 }
 
 async function fetchReasonCase(sfCaseId) {
-  const meta = await loadCaseFieldMeta();
+  const meta = await loadReasonMeta();
   const fields = ['Id'];
-  Object.values(REASON_SF).forEach(n => {
-    const f = meta.byLower.get(n.toLowerCase());
-    if (f) fields.push(f.name);
-    else console.warn(`⚠️ Salesforce field ${n} not found on Case`);
+  Object.entries(REASON_SF).forEach(([key, n]) => {
+    if (n) fields.push(n);
+    else console.warn(`⚠️ Salesforce field for "${key}" not found on Case`);
   });
   const soql = `SELECT ${fields.join(', ')} FROM Case WHERE Id = '${esc(sfCaseId)}' LIMIT 1`;
   const result = await withSf(conn => conn.query(soql));
@@ -830,7 +866,7 @@ app.post('/intercom/case-reason-app/initialize', async (req, res) => {
   let meta = null;
 
   try {
-    meta = await loadCaseFieldMeta();
+    meta = await loadReasonMeta();
 
     const [rec, attrs] = await Promise.all([
       sfCaseId ? fetchReasonCase(sfCaseId) : null,
@@ -895,45 +931,65 @@ app.post('/intercom/case-reason-app/submit', async (req, res) => {
   let notice;
 
   try {
-    meta = await loadCaseFieldMeta();
+    meta = await loadReasonMeta();
     if (!sfCaseId) throw new Error("No Salesforce ticket is linked to this conversation");
 
     const base = await fetchReasonCase(sfCaseId);
     if (!base) throw new Error("Salesforce ticket not found");
 
     const cur = {
-      primary: base[REASON_SF.primary] || "",
-      secondary: base[REASON_SF.secondary] || "",
-      tertiary: base[REASON_SF.tertiary] || ""
+      primary: (REASON_SF.primary && base[REASON_SF.primary]) || "",
+      secondary: (REASON_SF.secondary && base[REASON_SF.secondary]) || "",
+      tertiary: (REASON_SF.tertiary && base[REASON_SF.tertiary]) || ""
     };
     const next = { primary: values.primary, secondary: values.secondary, tertiary: values.tertiary };
     let wasReset = false;
-
-    // Reset dependent levels when a higher level changes (payload values below it are stale)
-    if (next.primary !== cur.primary) {
-      if (next.secondary || next.tertiary) wasReset = true;
-      next.secondary = "";
-      next.tertiary = "";
-    } else if (next.secondary !== cur.secondary) {
-      if (next.tertiary) wasReset = true;
-      next.tertiary = "";
-    }
-
-    // Drop values that are not valid for the selected parent
-    if (next.secondary && !picklistOptions(meta, REASON_SF.secondary, next.primary).includes(next.secondary)) next.secondary = "";
-    if (next.tertiary && !picklistOptions(meta, REASON_SF.tertiary, next.secondary).includes(next.tertiary)) next.tertiary = "";
-
     const sfChanges = {};
     const icChanges = {};
-    ['primary', 'secondary', 'tertiary'].forEach(k => {
-      if (next[k] !== cur[k]) {
-        sfChanges[REASON_SF[k]] = next[k] || null;
-        icChanges[REASON_IC[k]] = next[k] || null;
+
+    // Safety: if any topic field could not be resolved on Case, never touch the topics
+    const missingTopics = ['primary', 'secondary', 'tertiary'].filter(k => !REASON_SF[k]);
+    const topicsOk = missingTopics.length === 0;
+    let topicWarning = "";
+
+    if (topicsOk) {
+      // Reset dependent levels when a higher level changes (payload values below it are stale)
+      if (next.primary !== cur.primary) {
+        if (next.secondary || next.tertiary) wasReset = true;
+        next.secondary = "";
+        next.tertiary = "";
+      } else if (next.secondary !== cur.secondary) {
+        if (next.tertiary) wasReset = true;
+        next.tertiary = "";
       }
-    });
+
+      // A NEWLY chosen value that is not valid for its parent is rejected (we keep what is on the Case).
+      // Values that are already on the Case are never cleared by this check.
+      if (next.secondary && next.secondary !== cur.secondary &&
+          !picklistOptions(meta, REASON_SF.secondary, next.primary).includes(next.secondary)) {
+        next.secondary = cur.secondary;
+      }
+      if (next.tertiary && next.tertiary !== cur.tertiary &&
+          !picklistOptions(meta, REASON_SF.tertiary, next.secondary).includes(next.tertiary)) {
+        next.tertiary = cur.tertiary;
+      }
+
+      ['primary', 'secondary', 'tertiary'].forEach(k => {
+        if (next[k] !== cur[k]) {
+          sfChanges[REASON_SF[k]] = next[k] || null;
+          icChanges[REASON_IC[k]] = next[k] || null;
+        }
+      });
+    } else {
+      // Show what is on the Case, change nothing
+      next.primary = cur.primary;
+      next.secondary = cur.secondary;
+      next.tertiary = cur.tertiary;
+      topicWarning = ` ⚠️ Topics not saved: Salesforce field(s) not found for ${missingTopics.join(', ')}`;
+    }
 
     let notesSaved = false;
-    if (clickedButton === "save_notes_btn") {
+    if (clickedButton === "save_notes_btn" && REASON_SF.notes) {
       sfChanges[REASON_SF.notes] = inputs.case_summary || null;
       icChanges[REASON_IC.summary] = inputs.case_summary || null;
       notesSaved = true;
@@ -957,7 +1013,9 @@ app.post('/intercom/case-reason-app/submit', async (req, res) => {
       console.log(`Synced Case ${sfCaseId}:`, Object.keys(sfChanges).join(', '));
 
       let icNote = "";
-      if (convId && Object.keys(icChanges).length > 0) {
+      if (convId && Object.keys(icChanges).length > 0 && !process.env.INTERCOM_TOKEN) {
+        icNote = " ℹ️ Intercom attributes were not updated (INTERCOM_TOKEN is not set)";
+      } else if (convId && Object.keys(icChanges).length > 0) {
         try {
           await intercomRequest('PUT', `/conversations/${convId}`, { custom_attributes: icChanges });
         } catch (icErr) {
@@ -972,6 +1030,8 @@ app.post('/intercom/case-reason-app/submit', async (req, res) => {
       if (wasReset) notice += " (lower levels were reset)";
       if (icNote) notice = notice.replace(" and Intercom", "") + icNote;
     }
+
+    if (topicWarning) notice = (notice || "") + topicWarning;
 
     const attrs = await loadIntercomAttrs(req.body);
     stage = findStage(attrs);
