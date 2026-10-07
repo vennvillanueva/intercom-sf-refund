@@ -37,6 +37,16 @@ function formatAddress(addr) {
   return parts.length > 0 ? parts.join(', ') : "N/A";
 }
 
+// Helper: Parse Related_Account_IDs__c (Handles comma-separated string or array)
+function parseRelatedAccountIds(rawVal) {
+  if (!rawVal) return [];
+  if (Array.isArray(rawVal)) return rawVal;
+  return String(rawVal)
+    .split(/[\s,;]+/)
+    .map(id => id.trim())
+    .filter(id => id.length >= 15); // Valid Salesforce ID length check
+}
+
 // ==========================================
 // APP 1: REFUND APP (Form & Endpoints)
 // ==========================================
@@ -178,7 +188,7 @@ app.post('/intercom/submit', async (req, res) => {
 function buildAccountContactUI(values = {}, options = {}) {
   const components = [];
 
-  // 1. CONTACT SEARCH BLOCK (Supports Name, Email, or Phone Search)
+  // 1. CONTACT SEARCH BLOCK
   components.push(
     { type: "input", id: "contact_search_term", label: "Search Contact", value: values.contact_search_term || "", placeholder: "Name, email, or phone..." },
     { type: "button", id: "search_contact_btn", label: "🔍 Search Contact", style: "primary", action: { type: "submit" } }
@@ -202,7 +212,7 @@ function buildAccountContactUI(values = {}, options = {}) {
   components.push({ type: "text", text: `*Contact Status:* ${values.contact_status || 'N/A'}`, style: "paragraph" });
   components.push({ type: "divider" });
 
-  // 2. ACCOUNT SEARCH BLOCK
+  // 2. ACCOUNT SEARCH & RELATED ACCOUNTS DROPDOWN
   components.push(
     { type: "input", id: "account_search_term", label: "Search Account", value: values.account_search_term || "", placeholder: "Type account name..." },
     { type: "button", id: "search_account_btn", label: "🔍 Search Account", style: "primary", action: { type: "submit" } }
@@ -217,7 +227,7 @@ function buildAccountContactUI(values = {}, options = {}) {
     components.push({
       type: "dropdown",
       id: "selected_account_id",
-      label: "Select Matching Account",
+      label: options.isRelatedAccount ? "Select Related Account" : "Select Matching Account",
       options: accountDropdown,
       value: values.selected_account_id || accountDropdown[0].id
     });
@@ -234,7 +244,7 @@ function buildAccountContactUI(values = {}, options = {}) {
 
   components.push({ type: "divider" });
 
-  // 3. SOURCE DROPDOWN FIELD (Mapped to Source__c)
+  // 3. SOURCE DROPDOWN FIELD
   components.push({
     type: "dropdown",
     id: "source",
@@ -278,7 +288,6 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
   try {
     const conn = await getSalesforceConnection();
 
-    // Fetch existing Case Source__c & ContactId
     if (sfCaseId) {
       try {
         const sfCase = await conn.sobject('Case').retrieve(sfCaseId);
@@ -289,7 +298,6 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
       } catch (caseErr) { console.error("Case Fetch Error:", caseErr.message); }
     }
 
-    // Fetch Account Details
     if (sfAccountId) {
       try {
         const sfAccount = await conn.sobject('Account').retrieve(sfAccountId);
@@ -329,22 +337,54 @@ app.post('/intercom/account-app/submit', async (req, res) => {
   try {
     const conn = await getSalesforceConnection();
 
-    // 1. SEARCH CONTACT (Search Name OR Email OR Phone)
+    // 1. SEARCH CONTACT & AUTO-FETCH RELATED ACCOUNTS
     if (clickedButton === "search_contact_btn") {
       const searchTerm = (inputs.contact_search_term || "").trim();
       let contactList = [];
+      let accountList = [];
+      let isRelatedAccount = false;
+
       if (searchTerm) {
-        const query = `SELECT Id, Name, Email, Phone, Contact_Status__c FROM Contact WHERE Name LIKE '%${searchTerm}%' OR Email LIKE '%${searchTerm}%' OR Phone LIKE '%${searchTerm}%' LIMIT 10`;
+        const query = `SELECT Id, Name, Email, Phone, Contact_Status__c, AccountId, Account.Name, Related_Account_IDs__c FROM Contact WHERE Name LIKE '%${searchTerm}%' OR Email LIKE '%${searchTerm}%' OR Phone LIKE '%${searchTerm}%' LIMIT 10`;
         const result = await conn.query(query);
         contactList = result.records || [];
+
         if (contactList.length > 0) {
-          inputs.contact_status = contactList[0].Contact_Status__c || "N/A";
+          const matchedContact = contactList[0];
+          inputs.contact_status = matchedContact.Contact_Status__c || "N/A";
+
+          // Extract primary AccountId and Related_Account_IDs__c
+          const relatedIds = parseRelatedAccountIds(matchedContact.Related_Account_IDs__c);
+          if (matchedContact.AccountId && !relatedIds.includes(matchedContact.AccountId)) {
+            relatedIds.unshift(matchedContact.AccountId);
+          }
+
+          // If related account IDs exist, fetch ONLY those accounts
+          if (relatedIds.length > 0) {
+            const idListStr = relatedIds.map(id => `'${id}'`).join(',');
+            const accQuery = `SELECT Id, Name, Account_Status__c, Partner_Level__c, Website, Dashboard_URL__c, BillingAddress FROM Account WHERE Id IN (${idListStr})`;
+            const accResult = await conn.query(accQuery);
+            accountList = accResult.records || [];
+            isRelatedAccount = true;
+
+            if (accountList.length > 0) {
+              const topAcc = accountList[0];
+              inputs.selected_account_id = topAcc.Id;
+              inputs.account_search_term = topAcc.Name;
+              inputs.account_status = topAcc.Account_Status__c || "N/A";
+              inputs.partner_level = topAcc.Partner_Level__c || "N/A";
+              inputs.website = topAcc.Website || "N/A";
+              inputs.dashboard_url = topAcc.Dashboard_URL__c || "N/A";
+              inputs.billing_address = formatAddress(topAcc.BillingAddress);
+            }
+          }
         }
       }
-      return res.json({ canvas: { content: { components: buildAccountContactUI(inputs, { contactList }) } } });
+
+      return res.json({ canvas: { content: { components: buildAccountContactUI(inputs, { contactList, accountList, isRelatedAccount }) } } });
     }
 
-    // 2. SEARCH ACCOUNT
+    // 2. SEARCH ACCOUNT (Manual Search fallback)
     if (clickedButton === "search_account_btn") {
       const searchTerm = (inputs.account_search_term || "").trim();
       let accountList = [];
@@ -364,7 +404,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       return res.json({ canvas: { content: { components: buildAccountContactUI(inputs, { accountList }) } } });
     }
 
-    // 3. UPDATE SALESFORCE CASE TICKET (Updates ContactId, AccountId, & Source__c)
+    // 3. UPDATE SALESFORCE CASE TICKET
     const sfData = {
       Source__c: inputs.source || null
     };
