@@ -11,7 +11,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Reusable JSForce Connection with strict URL formatting
+// Reusable JSForce Connection
 let sfConn = null;
 
 async function getSalesforceConnection() {
@@ -179,8 +179,17 @@ app.post('/intercom/submit', async (req, res) => {
 // ==========================================
 // APP 2: SALESFORCE CASE MANAGER
 // ==========================================
-function buildAccountContactUI(values = {}, options = {}) {
+function buildAccountContactUI(values = {}, options = {}, message = null) {
   const components = [];
+
+  // Success / Status Notification Banner
+  if (message) {
+    components.push({
+      type: "text",
+      text: message,
+      style: "header"
+    });
+  }
 
   // 1. CONTACT SEARCH BLOCK
   components.push(
@@ -227,7 +236,7 @@ function buildAccountContactUI(values = {}, options = {}) {
     });
   }
 
-  // Read-only Account Data Display
+  // Read-only Account Data Display (Retained Values)
   components.push(
     { type: "text", text: `*Account Status:* ${values.account_status || 'N/A'}`, style: "paragraph" },
     { type: "text", text: `*Partner Level:* ${values.partner_level || 'N/A'}`, style: "paragraph" },
@@ -331,7 +340,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
   try {
     const conn = await getSalesforceConnection();
 
-    // 1. SEARCH CONTACT (Auto-fetches Primary Account)
+    // 1. SEARCH CONTACT
     if (clickedButton === "search_contact_btn") {
       const searchTerm = (inputs.contact_search_term || "").trim();
       let contactList = [];
@@ -346,7 +355,6 @@ app.post('/intercom/account-app/submit', async (req, res) => {
           const matchedContact = contactList[0];
           inputs.contact_status = matchedContact.Contact_Status__c || "N/A";
 
-          // Auto-fetch the Contact's default primary Account if available
           if (matchedContact.AccountId) {
             try {
               const accRecord = await conn.sobject('Account').retrieve(matchedContact.AccountId);
@@ -368,7 +376,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       return res.json({ canvas: { content: { components: buildAccountContactUI(inputs, { contactList, accountList }) } } });
     }
 
-    // 2. SEARCH ACCOUNT (Manual Search fallback option)
+    // 2. SEARCH ACCOUNT
     if (clickedButton === "search_account_btn") {
       const searchTerm = (inputs.account_search_term || "").trim();
       let accountList = [];
@@ -388,7 +396,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       return res.json({ canvas: { content: { components: buildAccountContactUI(inputs, { accountList }) } } });
     }
 
-    // 3. UPDATE SALESFORCE CASE TICKET
+    // 3. UPDATE SALESFORCE CASE TICKET & RETAIN DISPLAY VALUES
     const sfData = {
       Source__c: inputs.source || null
     };
@@ -410,15 +418,53 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       console.log(`Created New Case ${result.id}`);
     }
 
-    res.json({ canvas: { content: { components: buildAccountContactUI(inputs) } } });
+    // Re-fetch Account details so that Account Status, Partner Level, etc. remain displayed
+    let updatedAccountList = [];
+    if (inputs.selected_account_id) {
+      try {
+        const currentAcc = await conn.sobject('Account').retrieve(inputs.selected_account_id);
+        if (currentAcc) {
+          updatedAccountList = [currentAcc];
+          inputs.account_search_term = currentAcc.Name;
+          inputs.account_status = currentAcc.Account_Status__c || "N/A";
+          inputs.partner_level = currentAcc.Partner_Level__c || "N/A";
+          inputs.website = currentAcc.Website || "N/A";
+          inputs.dashboard_url = currentAcc.Dashboard_URL__c || "N/A";
+          inputs.billing_address = formatAddress(currentAcc.BillingAddress);
+        }
+      } catch (fErr) { console.error(fErr.message); }
+    }
+
+    // Re-fetch Contact status if contact is selected
+    if (inputs.selected_contact_id) {
+      try {
+        const currentContact = await conn.sobject('Contact').retrieve(inputs.selected_contact_id);
+        if (currentContact) {
+          inputs.contact_status = currentContact.Contact_Status__c || "N/A";
+        }
+      } catch (cErr) { console.error(cErr.message); }
+    }
+
+    res.json({
+      canvas: {
+        content: {
+          components: buildAccountContactUI(inputs, { accountList: updatedAccountList }, "✅ Contact & Account Updated Successfully!")
+        }
+      }
+    });
 
   } catch (err) {
     console.error("Case Manager Submit Error:", err.message);
     sfConn = null;
-    res.json({ canvas: { content: { components: buildAccountContactUI(inputs) } } });
+    res.json({
+      canvas: {
+        content: {
+          components: buildAccountContactUI(inputs, {}, `❌ Update Error: ${err.message}`)
+        }
+      }
+    });
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
