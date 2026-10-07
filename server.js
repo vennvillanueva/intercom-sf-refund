@@ -41,7 +41,7 @@ function formatAddress(addr) {
   return parts.length > 0 ? parts.join(', ') : "N/A";
 }
 
-// Helper: Extract Salesforce Case ID from all possible Intercom payload paths
+// Helper: Extract Salesforce Case ID across all possible Intercom payload paths
 function extractSfCaseId(body) {
   return body.conversation?.custom_attributes?.salesforce_id
       || body.conversation?.custom_attributes?.salesforce_case_id
@@ -123,6 +123,7 @@ function buildRefundForm(values = {}) {
 app.post('/intercom/initialize', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
   let existingValues = {};
+
   if (sfCaseId) {
     try {
       const conn = await getSalesforceConnection();
@@ -145,14 +146,16 @@ app.post('/intercom/initialize', async (req, res) => {
           refund_complete: sfRecord.Refund_Complete__c ? "Yes" : "No"
         };
       }
-    } catch (err) { console.error("Initialize Case Fetch Error:", err.message); }
+    } catch (err) { console.error("Refund App Initialize Case Fetch Error:", err.message); }
   }
+
   res.json({ canvas: { content: { components: buildRefundForm(existingValues) } } });
 });
 
 app.post('/intercom/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
   const sfCaseId = extractSfCaseId(req.body);
+
   try {
     const conn = await getSalesforceConnection();
     const sfData = {
@@ -171,13 +174,16 @@ app.post('/intercom/submit', async (req, res) => {
       Stripe_Reimbursement_Link__c: inputs.stripe_reimbursement_link || null,
       Refund_Complete__c: inputs.refund_complete === "Yes"
     };
+
     if (sfCaseId) {
       sfData.Id = sfCaseId;
       await conn.sobject('Case').update(sfData);
     } else {
       await conn.sobject('Case').create(sfData);
     }
+
     res.json({ canvas: { content: { components: buildRefundForm(inputs) } } });
+
   } catch (error) {
     sfConn = null;
     res.json({ canvas: { content: { components: buildRefundForm(inputs) } } });
@@ -298,7 +304,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
   return components;
 }
 
-// INITIALIZE FLOW (Identical to Refund logic: Single Direct SOQL Query for Case + Contact + Account)
+// INITIALIZE FLOW
 app.post('/intercom/account-app/initialize', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
 
