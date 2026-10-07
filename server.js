@@ -50,21 +50,16 @@ function buildRefundForm(values = {}, options = {}, successMessage = null) {
     });
   }
 
-  // 1. Account Details (Auto-fetched from Intercom salesforce_account_id but Editable)
+  // -------------------------------------------------------------
+  // 1. CONTACT NAME SECTION (Search Contact)
+  // -------------------------------------------------------------
   components.push(
-    { type: "input", id: "account_name", label: "Account Name", value: values.account_name || "" },
-    { type: "input", id: "account_status", label: "Account Status", value: values.account_status || "" }
-  );
-
-  // 2. Contact Search & Lookup Selection
-  components.push(
-    { type: "input", id: "contact_search_term", label: "Search Contact Name", value: values.contact_search_term || "", placeholder: "Type name to search SF contacts..." },
+    { type: "input", id: "contact_search_term", label: "Contact Name", value: values.contact_search_term || "", placeholder: "Search SF Contact..." },
     { type: "button", id: "search_contact_btn", label: "🔍 Search Contact", style: "secondary", action: { type: "submit" } }
   );
 
-  // Kapag may nahanap na contacts mula sa search, lalabas itong dropdown selector
   if (options.contactList && options.contactList.length > 0) {
-    const dropdownOptions = options.contactList.map(c => ({
+    const contactDropdown = options.contactList.map(c => ({
       type: "option",
       id: c.Id,
       text: `${c.Name} (${c.Email || 'No Email'})`
@@ -73,9 +68,9 @@ function buildRefundForm(values = {}, options = {}, successMessage = null) {
     components.push({
       type: "dropdown",
       id: "selected_contact_id",
-      label: "Select Matching Contact",
-      options: dropdownOptions,
-      value: values.selected_contact_id || dropdownOptions[0].id
+      label: "Select Contact Result",
+      options: contactDropdown,
+      value: values.selected_contact_id || contactDropdown[0].id
     });
   } else if (values.selected_contact_name) {
     components.push({
@@ -85,9 +80,42 @@ function buildRefundForm(values = {}, options = {}, successMessage = null) {
     });
   }
 
+  // -------------------------------------------------------------
+  // 2. ACCOUNT NAME SECTION (Search Account)
+  // -------------------------------------------------------------
+  components.push(
+    { type: "input", id: "account_search_term", label: "Account Name", value: values.account_search_term || values.account_name || "", placeholder: "Search SF Account..." },
+    { type: "button", id: "search_account_btn", label: "🔍 Search Account", style: "secondary", action: { type: "submit" } }
+  );
+
+  if (options.accountList && options.accountList.length > 0) {
+    const accountDropdown = options.accountList.map(a => ({
+      type: "option",
+      id: a.Id,
+      text: `${a.Name} (${a.Account_Status__c || 'No Status'})`
+    }));
+
+    components.push({
+      type: "dropdown",
+      id: "selected_account_id",
+      label: "Select Account Result",
+      options: accountDropdown,
+      value: values.selected_account_id || accountDropdown[0].id
+    });
+  }
+
+  // -------------------------------------------------------------
+  // 3. ACCOUNT STATUS (Auto-populated or Editable)
+  // -------------------------------------------------------------
+  components.push(
+    { type: "input", id: "account_status", label: "Account Status", value: values.account_status || "" }
+  );
+
   components.push({ type: "divider" });
 
-  // 3. Order & Refund Details
+  // -------------------------------------------------------------
+  // 4. ORDER & REFUND DETAILS
+  // -------------------------------------------------------------
   components.push(
     { type: "input", id: "order_id", label: "Order ID", value: values.order_id || "" },
     { type: "input", id: "date_of_order", label: "Date of Order", value: values.date_of_order || "", placeholder: "YYYY-MM-DD" },
@@ -164,7 +192,7 @@ function buildRefundForm(values = {}, options = {}, successMessage = null) {
   return components;
 }
 
-// 1. INITIALIZE FLOW (Pre-populate Account Name, Account Status, and Case Data)
+// 1. INITIALIZE FLOW
 app.post('/intercom/initialize', async (req, res) => {
   const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
                 || req.body.custom_attributes?.salesforce_id
@@ -179,13 +207,14 @@ app.post('/intercom/initialize', async (req, res) => {
   try {
     const conn = await getSalesforceConnection();
 
-    // Fetch Account Name & Account_Status__c via salesforce_account_id
+    // Default Account Name at Status mula sa Intercom salesforce_account_id
     if (sfAccountId) {
       try {
         const sfAccount = await conn.sobject('Account').retrieve(sfAccountId);
         if (sfAccount) {
           existingValues.account_name = sfAccount.Name || "";
           existingValues.account_status = sfAccount.Account_Status__c || "";
+          existingValues.selected_account_id = sfAccountId;
         }
       } catch (accErr) {
         console.error("Account Fetch Error:", accErr.message);
@@ -214,7 +243,10 @@ app.post('/intercom/initialize', async (req, res) => {
 
         if (sfRecord.ContactId) {
           const contactRec = await conn.sobject('Contact').retrieve(sfRecord.ContactId);
-          existingValues.selected_contact_name = contactRec ? contactRec.Name : "";
+          if (contactRec) {
+            existingValues.contact_search_term = contactRec.Name;
+            existingValues.selected_contact_name = contactRec.Name;
+          }
         }
       }
     }
@@ -231,10 +263,10 @@ app.post('/intercom/initialize', async (req, res) => {
   });
 });
 
-// 2. SUBMIT FLOW (Handles Contact Search or Ticket Update)
+// 2. SUBMIT FLOW (Handles Contact Search, Account Search, or Ticket Update)
 app.post('/intercom/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
-  const clickedButton = req.body.component_id; // Hanapin kung aling button ang pinindot
+  const clickedButton = req.body.component_id;
   
   const sfCaseId = req.body.conversation?.custom_attributes?.salesforce_id 
                 || req.body.custom_attributes?.salesforce_id
@@ -243,9 +275,9 @@ app.post('/intercom/submit', async (req, res) => {
   try {
     const conn = await getSalesforceConnection();
 
-    // CASE A: PININDOT ANG "SEARCH CONTACT" BUTTON
-    if (clickedButton === "search_contact_btn" || (inputs.contact_search_term && !clickedButton)) {
-      const searchTerm = inputs.contact_search_term.trim();
+    // CASE A: SEARCH CONTACT
+    if (clickedButton === "search_contact_btn") {
+      const searchTerm = (inputs.contact_search_term || "").trim();
       let contactList = [];
 
       if (searchTerm) {
@@ -263,7 +295,33 @@ app.post('/intercom/submit', async (req, res) => {
       });
     }
 
-    // CASE B: UPDATE / CREATE SALESFORCE TICKET
+    // CASE B: SEARCH ACCOUNT (Kukunin din ang Account_Status__c)
+    if (clickedButton === "search_account_btn") {
+      const searchTerm = (inputs.account_search_term || "").trim();
+      let accountList = [];
+
+      if (searchTerm) {
+        const query = `SELECT Id, Name, Account_Status__c FROM Account WHERE Name LIKE '%${searchTerm}%' LIMIT 10`;
+        const result = await conn.query(query);
+        accountList = result.records || [];
+
+        // Kung may lumabas na pumasok na account, kuhanin ang status ng kauna-unahang resulta
+        if (accountList.length > 0) {
+          inputs.account_status = accountList[0].Account_Status__c || "";
+          inputs.account_name = accountList[0].Name;
+        }
+      }
+
+      return res.json({
+        canvas: {
+          content: {
+            components: buildRefundForm(inputs, { accountList }, accountList.length > 0 ? `Found ${accountList.length} matching accounts:` : "No accounts found.")
+          }
+        }
+      });
+    }
+
+    // CASE C: UPDATE / CREATE SALESFORCE TICKET
     const sfData = {
       Order_ID__c: inputs.order_id || null,
       Date_of_Order__c: inputs.date_of_order || null,
@@ -278,9 +336,12 @@ app.post('/intercom/submit', async (req, res) => {
       Refund_Complete__c: inputs.refund_complete === "Yes"
     };
 
-    // Attach ContactId kung may napili sa dropdown selector
     if (inputs.selected_contact_id) {
       sfData.ContactId = inputs.selected_contact_id;
+    }
+
+    if (inputs.selected_account_id) {
+      sfData.AccountId = inputs.selected_account_id;
     }
 
     if (sfCaseId) {
