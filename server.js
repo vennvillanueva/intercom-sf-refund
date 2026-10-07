@@ -769,9 +769,13 @@ async function intercomRequest(method, path, body) {
 async function loadIntercomAttrs(body) {
   const payloadAttrs = (body.conversation && body.conversation.custom_attributes) || {};
   const convId = body.conversation && body.conversation.id;
-  if (!convId || !process.env.INTERCOM_TOKEN) return payloadAttrs;
+  if (!convId || !process.env.INTERCOM_TOKEN) {
+    console.log('Intercom attrs loaded from app payload (no INTERCOM_TOKEN or no conversation id)');
+    return payloadAttrs;
+  }
   try {
     const conv = await intercomRequest('GET', `/conversations/${convId}`);
+    console.log('Intercom attrs loaded from API');
     return conv.custom_attributes || payloadAttrs;
   } catch (e) {
     console.error('Intercom conversation fetch error:', e.message);
@@ -835,7 +839,8 @@ function reasonDropdown(id, label, options, value) {
 
 function buildReasonUI(values, stage, meta, message) {
   const components = [
-    { type: "text", text: `*Conversation Stage:* ${stage || 'N/A'}`, style: "header" }
+    { type: "text", text: `*Conversation Stage:* ${stage || 'N/A'}`, style: "header" },
+    { type: "button", id: "refresh_btn", label: "🔄 Refresh", style: "secondary", action: { type: "submit" } }
   ];
   if (message) components.push({ type: "text", text: message, style: "paragraph" });
   components.push({ type: "divider" });
@@ -942,6 +947,21 @@ app.post('/intercom/case-reason-app/submit', async (req, res) => {
       secondary: (REASON_SF.secondary && base[REASON_SF.secondary]) || "",
       tertiary: (REASON_SF.tertiary && base[REASON_SF.tertiary]) || ""
     };
+    // REFRESH: reload everything from Salesforce/Intercom and save nothing.
+    // (Must run before the change detection below, which would treat the payload as new input.)
+    if (clickedButton === "refresh_btn") {
+      values.primary = cur.primary;
+      values.secondary = cur.secondary;
+      values.tertiary = cur.tertiary;
+      values.case_summary = (REASON_SF.notes && base[REASON_SF.notes]) || "";
+      const freshAttrs = await loadIntercomAttrs(req.body);
+      stage = findStage(freshAttrs);
+      console.log('CASE REASON REFRESH stage =', stage);
+      return res.json({
+        canvas: { content: { components: buildReasonUI(values, stage, meta, "🔄 Refreshed") } }
+      });
+    }
+
     const next = { primary: values.primary, secondary: values.secondary, tertiary: values.tertiary };
     let wasReset = false;
     const sfChanges = {};
