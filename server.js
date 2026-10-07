@@ -15,14 +15,17 @@ app.use((req, res, next) => {
 let sfConn = null;
 
 async function getSalesforceConnection() {
-  if (sfConn && sfConn.accessToken && sfConn.instanceUrl) {
+  if (sfConn && sfConn.accessToken && sfConn.instanceUrl && sfConn.instanceUrl.startsWith('http')) {
     return sfConn;
   }
   
-  const loginUrl = process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com';
+  let loginUrl = process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com';
+  if (!loginUrl.startsWith('http')) {
+    loginUrl = `https://${loginUrl}`;
+  }
   
   sfConn = new jsforce.Connection({
-    loginUrl: loginUrl.startsWith('http') ? loginUrl : `https://${loginUrl}`,
+    loginUrl: loginUrl,
     version: '57.0'
   });
 
@@ -30,6 +33,10 @@ async function getSalesforceConnection() {
     process.env.SF_USERNAME,
     process.env.SF_PASSWORD + process.env.SF_SECURITY_TOKEN
   );
+
+  if (sfConn.instanceUrl && !sfConn.instanceUrl.startsWith('http')) {
+    sfConn.instanceUrl = `https://${sfConn.instanceUrl}`;
+  }
 
   return sfConn;
 }
@@ -54,11 +61,28 @@ function extractSfCaseId(body) {
       || body.user?.custom_attributes?.salesforce_case_id;
 }
 
+// Helper to safely parse float inputs without returning NaN
+function safeParseFloat(val) {
+  if (!val || val === "") return null;
+  const parsed = parseFloat(val);
+  return isNaN(parsed) ? null : parsed;
+}
+
 // ==========================================
 // APP 1: REFUND DETAILS APP
 // ==========================================
-function buildRefundForm(values = {}) {
-  return [
+function buildRefundForm(values = {}, message = null) {
+  const components = [];
+
+  if (message) {
+    components.push({
+      type: "text",
+      text: message,
+      style: "header"
+    });
+  }
+
+  components.push(
     { type: "input", id: "order_id", label: "Order ID", value: values.order_id || "" },
     { type: "input", id: "date_of_order", label: "Date of Order", value: values.date_of_order || "", placeholder: "YYYY-MM-DD" },
     { type: "input", id: "guest_name", label: "Guest Name", value: values.guest_name || "" },
@@ -117,10 +141,12 @@ function buildRefundForm(values = {}) {
       value: values.refund_complete || ""
     },
     { type: "button", id: "submit_refund", label: "Update Salesforce Ticket", style: "primary", action: { type: "submit" } }
-  ];
+  );
+
+  return components;
 }
 
-// INITIALIZE REFUND APP (Hard Refresh Safe)
+// INITIALIZE REFUND APP
 app.post('/intercom/initialize', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
   let existingValues = {};
@@ -172,12 +198,16 @@ app.post('/intercom/initialize', async (req, res) => {
           };
         }
       }
-    } catch (err) { console.error("Refund App Initialize Error:", err.message); }
+    } catch (err) { 
+      console.error("Refund App Initialize Error:", err.message); 
+      sfConn = null;
+    }
   }
 
   res.json({ canvas: { content: { components: buildRefundForm(existingValues) } } });
 });
 
+// SUBMIT REFUND APP (With Safe Parsing & Notification Banner)
 app.post('/intercom/submit', async (req, res) => {
   const inputs = req.body.input_values || {};
   const sfCaseId = extractSfCaseId(req.body);
@@ -192,10 +222,10 @@ app.post('/intercom/submit', async (req, res) => {
       Delivery_Order_ID__c: inputs.delivery_order_id || null,
       Delivery_Partner__c: inputs.delivery_partner || null,
       Dispute_ID__c: inputs.dispute_id || null,
-      Amount_Issued_to_Customer_Account__c: inputs.amount_issued_account ? parseFloat(inputs.amount_issued_account) : null,
-      Amount_Issued_to_Guest__c: inputs.amount_issued_guest ? parseFloat(inputs.amount_issued_guest) : null,
+      Amount_Issued_to_Customer_Account__c: safeParseFloat(inputs.amount_issued_account),
+      Amount_Issued_to_Guest__c: safeParseFloat(inputs.amount_issued_guest),
       Refund_Reason_Notes__c: inputs.refund_reason_notes || null,
-      Third_Party_Reimbursement_Amount__c: inputs.third_party_reimbursement_amount ? parseFloat(inputs.third_party_reimbursement_amount) : null,
+      Third_Party_Reimbursement_Amount__c: safeParseFloat(inputs.third_party_reimbursement_amount),
       Third_Party_Reimbursement_Status__c: inputs.third_party_reimbursement_status || null,
       Stripe_Reimbursement_Link__c: inputs.stripe_reimbursement_link || null,
       Refund_Complete__c: inputs.refund_complete === "Yes"
@@ -204,15 +234,29 @@ app.post('/intercom/submit', async (req, res) => {
     if (sfCaseId) {
       sfData.Id = sfCaseId;
       await conn.sobject('Case').update(sfData);
+      console.log(`Successfully updated Refund details for Case ${sfCaseId}`);
     } else {
       await conn.sobject('Case').create(sfData);
     }
 
-    res.json({ canvas: { content: { components: buildRefundForm(inputs) } } });
+    res.json({
+      canvas: {
+        content: {
+          components: buildRefundForm(inputs, "✅ Refund details updated to Salesforce ticket")
+        }
+      }
+    });
 
   } catch (error) {
+    console.error("Refund Submit Error:", error.message);
     sfConn = null;
-    res.json({ canvas: { content: { components: buildRefundForm(inputs) } } });
+    res.json({
+      canvas: {
+        content: {
+          components: buildRefundForm(inputs, `❌ Save Error: ${error.message}`)
+        }
+      }
+    });
   }
 });
 
@@ -330,7 +374,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
   return components;
 }
 
-// INITIALIZE CASE MANAGER APP (Hard Refresh Safe)
+// INITIALIZE CASE MANAGER APP
 app.post('/intercom/account-app/initialize', async (req, res) => {
   const sfCaseId = extractSfCaseId(req.body);
 
@@ -368,7 +412,10 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
           accountList = [{ Id: sfCase.AccountId, Name: sfCase.Account.Name }];
         }
       }
-    } catch (err) { console.error("Case Manager Direct Query Initialize Error:", err.message); }
+    } catch (err) { 
+      console.error("Case Manager Direct Query Initialize Error:", err.message);
+      sfConn = null;
+    }
   }
 
   res.json({
