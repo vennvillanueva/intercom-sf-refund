@@ -267,7 +267,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
     { type: "divider" }
   );
 
-  // 4. SOURCE DROPDOWN FIELD
+  // 4. SOURCE DROPDOWN FIELD WITH AUTO-SUBMIT ACTION
   components.push({
     type: "dropdown",
     id: "source",
@@ -282,7 +282,8 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
       { type: "option", id: "Google", text: "Google" },
       { type: "option", id: "Other", text: "Other" }
     ],
-    value: values.source || ""
+    value: values.source || "",
+    action: { type: "submit" }
   });
 
   return components;
@@ -304,11 +305,10 @@ app.post('/intercom/account-app/initialize', async (req, res) => {
       const sfCase = await conn.sobject('Case').retrieve(sfCaseId);
 
       if (sfCase) {
-        initialValues.source = sfCase.Source__c || "";
+        initialValues.source = sfCase.Source__c || sfCase.Origin || "";
         initialValues.selected_contact_id = sfCase.ContactId || "";
         initialValues.selected_account_id = sfCase.AccountId || "";
 
-        // Safe parallel fetch
         const fetchPromises = [];
 
         if (sfCase.ContactId) {
@@ -367,12 +367,15 @@ app.post('/intercom/account-app/submit', async (req, res) => {
 
   inputs.sfCaseId = sfCaseId;
 
+  let updateNotice = "✅ Salesforce ticket updated";
+
   try {
     const conn = await getSalesforceConnection();
 
     let contactList = [];
     let accountList = [];
 
+    // 1. ACTION: SEARCH CONTACT BUTTON CLICKED
     if (clickedButton === "search_contact_btn") {
       const searchTerm = (inputs.contact_search_term || "").trim();
       if (searchTerm) {
@@ -385,6 +388,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       }
     }
 
+    // 2. ACTION: SEARCH ACCOUNT BUTTON CLICKED
     if (clickedButton === "search_account_btn") {
       const searchTerm = (inputs.account_search_term || "").trim();
       if (searchTerm) {
@@ -397,6 +401,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       }
     }
 
+    // 3. INDEPENDENT CONTACT RETRIEVAL
     if (inputs.selected_contact_id) {
       try {
         const targetContact = await conn.sobject('Contact').retrieve(inputs.selected_contact_id);
@@ -413,6 +418,7 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       } catch (cErr) { console.error("Contact Retrieve Error:", cErr.message); }
     }
 
+    // 4. INDEPENDENT ACCOUNT RETRIEVAL
     if (inputs.selected_account_id) {
       try {
         const targetAcc = await conn.sobject('Account').retrieve(inputs.selected_account_id);
@@ -428,22 +434,43 @@ app.post('/intercom/account-app/submit', async (req, res) => {
       } catch (aErr) { console.error("Account Retrieve Error:", aErr.message); }
     }
 
+    // Determine Specific Update Notice Banner
+    if (clickedButton === "source" || inputs.source) {
+      updateNotice = "✅ Source set to Salesforce ticket";
+    }
+    if (clickedButton === "selected_contact_id" || clickedButton === "search_contact_btn") {
+      updateNotice = "✅ Contact updated to Salesforce ticket";
+    }
+    if (clickedButton === "selected_account_id" || clickedButton === "search_account_btn") {
+      updateNotice = "✅ Account updated to Salesforce ticket";
+    }
+
+    // UPDATE BOTH Source__c & Origin TO GUARANTEE INSTANT SYNC IN SALESFORCE
     if (sfCaseId) {
       const sfData = {
         Id: sfCaseId,
-        Source__c: inputs.source || null,
         ContactId: inputs.selected_contact_id || null,
         AccountId: inputs.selected_account_id || null
       };
 
-      await conn.sobject('Case').update(sfData);
-      console.log(`Auto-synced Case ${sfCaseId}`);
+      if (inputs.source) {
+        sfData.Source__c = inputs.source;
+        sfData.Origin = inputs.source;
+      }
+
+      try {
+        await conn.sobject('Case').update(sfData);
+        console.log(`Auto-synced Case ${sfCaseId} with Source: ${inputs.source}`);
+      } catch (updErr) {
+        delete sfData.Origin;
+        await conn.sobject('Case').update(sfData);
+      }
     }
 
     res.json({
       canvas: {
         content: {
-          components: buildAccountContactUI(inputs, { contactList, accountList }, "✅ Auto-synced to Salesforce Ticket!")
+          components: buildAccountContactUI(inputs, { contactList, accountList }, updateNotice)
         }
       }
     });
@@ -461,7 +488,5 @@ app.post('/intercom/account-app/submit', async (req, res) => {
   }
 });
 
-// Explicit host '0.0.0.0' for instant Render port discovery
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
-
