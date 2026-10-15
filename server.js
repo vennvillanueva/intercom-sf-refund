@@ -3,7 +3,9 @@ const express = require('express');
 const jsforce = require('jsforce');
 
 const app = express();
-app.use(express.json());
+// Intercom sends the whole conversation (custom attributes, contact data, etc.) with every request.
+// Express's default JSON limit is only 100kb, which production conversations can exceed.
+app.use(express.json({ limit: '5mb' }));
 
 // ==========================================
 // SALESFORCE CONNECTION (race-condition safe)
@@ -11,10 +13,30 @@ app.use(express.json());
 let sfConn = null;        // only ever holds a fully logged-in connection
 let loginPromise = null;  // in-flight login; concurrent requests wait on this
 
+// Required configuration. There is intentionally NO default Salesforce URL, so a
+// missing or misspelled variable can never silently connect to the wrong org.
+const REQUIRED_ENV = ['SF_LOGIN_URL', 'SF_USERNAME', 'SF_PASSWORD'];
+const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missingEnv.length > 0) {
+  console.error(`FATAL: missing required environment variable(s): ${missingEnv.join(', ')}`);
+  process.exit(1);
+}
+
 function sfBaseUrl() {
-  let url = process.env.SF_LOGIN_URL || 'https://ownercom--qa.sandbox.my.salesforce.com';
+  let url = process.env.SF_LOGIN_URL;
   if (!url.startsWith('http')) url = `https://${url}`;
   return url.replace(/\/+$/, '');
+}
+
+// Link used by the "Go to Salesforce Ticket" button.
+// Optional SF_UI_URL (e.g. https://ownercom.lightning.force.com) opens the Lightning record page.
+function sfCaseUrl(caseId) {
+  const ui = process.env.SF_UI_URL;
+  if (ui) {
+    const base = (ui.startsWith('http') ? ui : `https://${ui}`).replace(/\/+$/, '');
+    return `${base}/lightning/r/Case/${caseId}/view`;
+  }
+  return `${sfBaseUrl()}/${caseId}`;
 }
 
 async function getSalesforceConnection() {
@@ -25,7 +47,7 @@ async function getSalesforceConnection() {
     const conn = new jsforce.Connection({ loginUrl: sfBaseUrl(), version: '57.0' });
     await conn.login(
       process.env.SF_USERNAME,
-      process.env.SF_PASSWORD + process.env.SF_SECURITY_TOKEN
+      process.env.SF_PASSWORD + (process.env.SF_SECURITY_TOKEN || '')
     );
     if (conn.instanceUrl && !conn.instanceUrl.startsWith('http')) {
       conn.instanceUrl = `https://${conn.instanceUrl}`;
@@ -349,7 +371,7 @@ function buildAccountContactUI(values = {}, options = {}, message = null) {
 
   // 1. GO TO SALESFORCE TICKET BUTTON
   if (values.sfCaseId) {
-    const caseUrl = `${sfBaseUrl()}/${values.sfCaseId}`;
+    const caseUrl = sfCaseUrl(values.sfCaseId);
     components.push(
       {
         type: "button",
@@ -695,3 +717,4 @@ app.listen(PORT, '0.0.0.0', () => {
   // Warm-up: log in and describe Case at startup so the first request is fast
   loadCaseFieldMeta().catch(e => console.error('Warm-up error:', e.message));
 });
+
